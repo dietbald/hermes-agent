@@ -11,9 +11,11 @@ from __future__ import annotations
 import inspect
 import os
 import shutil
+import signal
 import socket
 import sys
 import tempfile
+import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,35 @@ from typing import Any, Literal
 from unittest.mock import patch
 
 from hermes_constants import get_hermes_home
+
+# Scratch-dir naming and limits. The prefix carries the owning pid so an
+# abandoned directory (SIGKILL leaves no chance to clean up) can be attributed
+# and swept on the next run instead of sitting on disk until it fills it.
+DOCTOR_TEMPDIR_PREFIX = "hermes-plugin-doctor-"
+STALE_TEMPDIR_AGE_SECONDS = 6 * 60 * 60
+
+# A plugin is source: a manifest, Python modules, maybe a few assets. Anything
+# past these bounds is a checkout or a parent tree, not a plugin, and copying it
+# is what turned a doctor run into tens of GB of /tmp.
+MAX_COPY_BYTES = 512 * 1024 * 1024
+MAX_COPY_FILES = 20_000
+
+_MANIFEST_FILENAMES = ("plugin.yaml", "plugin.yml", "plugin.json")
+_COPY_IGNORE_PATTERNS = (
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    "*.pyc",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "build",
+    "dist",
+    "*.egg-info",
+)
 
 
 class _DoctorLoadError(RuntimeError):
@@ -32,6 +63,160 @@ def _deny_network(*_args: Any, **_kwargs: Any) -> None:
     raise RuntimeError("network access is disabled while Plugin Doctor runs")
 
 
+def _manifest_file(path: Path) -> Path | None:
+    """Return the plugin manifest directly inside *path*, if there is one."""
+    for name in _MANIFEST_FILENAMES:
+        candidate = path / name
+        if candidate.exists() or candidate.is_symlink():
+            return candidate
+    return None
+
+
+def _discover_manifests(path: Path) -> list[Path]:
+    """Find the manifests Hermes discovery would find under *path*.
+
+    Mirrors ``PluginManager._scan_directory``: a manifest sits either in the
+    plugin directory itself or, for the category layout
+    (``image_gen/openai/plugin.yaml``), one level down. Running this *before*
+    the scratch copy is what keeps Doctor from mirroring a whole checkout and
+    only then reporting that it found no plugin.
+    """
+    direct = _manifest_file(path)
+    if direct is not None:
+        return [direct]
+    found: list[Path] = []
+    try:
+        children = sorted(path.iterdir())
+    except OSError:
+        return found
+    for child in children:
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        manifest = _manifest_file(child)
+        if manifest is not None:
+            found.append(manifest)
+        if len(found) > 1:
+            break  # the caller only needs to know it is more than one
+    return found
+
+
+def _measure_copy(root: Path) -> tuple[int, int]:
+    """Size the copy Doctor is about to make, applying the copy's own filters.
+
+    Measuring first means an oversized target costs a directory walk instead of
+    a partial multi-gigabyte write that then has to be thrown away. Symlinks are
+    counted as links, never followed, matching ``copytree(symlinks=True)``.
+    """
+    ignore = shutil.ignore_patterns(*_COPY_IGNORE_PATTERNS)
+    total_bytes = 0
+    total_files = 0
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        skipped = ignore(current, [*dirnames, *filenames])
+        dirnames[:] = [name for name in dirnames if name not in skipped]
+        for name in filenames:
+            if name in skipped:
+                continue
+            entry = Path(current) / name
+            if entry.is_symlink():
+                continue
+            try:
+                total_bytes += entry.stat().st_size
+            except OSError:
+                continue
+            total_files += 1
+            if total_bytes > MAX_COPY_BYTES or total_files > MAX_COPY_FILES:
+                return total_bytes, total_files
+    return total_bytes, total_files
+
+
+def _is_abandoned_tempdir(path: Path, *, now: float) -> bool:
+    """True when a Doctor scratch dir has no live owner left."""
+    suffix = path.name[len(DOCTOR_TEMPDIR_PREFIX) :]
+    owner, _, _ = suffix.partition("-")
+    if owner.isdigit():
+        pid = int(owner)
+        if pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass  # alive, owned by another user
+        except OSError:
+            return False
+    # Unknown or reused pid: fall back to age, so pre-fix leftovers still go.
+    try:
+        return (now - path.stat().st_mtime) > STALE_TEMPDIR_AGE_SECONDS
+    except OSError:
+        return False
+
+
+def sweep_stale_doctor_tempdirs(root: Path | None = None) -> list[Path]:
+    """Delete Doctor scratch dirs whose run is gone. Best effort, never raises.
+
+    ``SIGKILL`` cannot be trapped, so no in-process handler can guarantee
+    cleanup. This sweep is the backstop: every doctor run clears what earlier
+    runs could not.
+    """
+    directory = Path(root) if root is not None else Path(tempfile.gettempdir())
+    now = time.time()
+    removed: list[Path] = []
+    try:
+        candidates = sorted(directory.glob(f"{DOCTOR_TEMPDIR_PREFIX}*"))
+    except OSError:
+        return removed
+    for candidate in candidates:
+        try:
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            if not _is_abandoned_tempdir(candidate, now=now):
+                continue
+            shutil.rmtree(candidate, ignore_errors=True)
+            if not candidate.exists():
+                removed.append(candidate)
+        except OSError:
+            continue
+    return removed
+
+
+@contextmanager
+def _doctor_scratch_dir():
+    """Yield a scratch dir that survives neither normal exit nor termination.
+
+    ``tempfile.TemporaryDirectory`` only cleans up via its finalizer, which a
+    default ``SIGTERM``/``SIGHUP`` disposition never reaches — that is how a
+    killed doctor run left its whole copy behind. Trap those signals, and sweep
+    for what ``SIGKILL`` leaves.
+    """
+    sweep_stale_doctor_tempdirs()
+    path = Path(tempfile.mkdtemp(prefix=f"{DOCTOR_TEMPDIR_PREFIX}{os.getpid()}-"))
+    installed: list[tuple[int, Any]] = []
+
+    def _terminate(signum: int, _frame: Any) -> None:
+        shutil.rmtree(path, ignore_errors=True)
+        for number, previous in installed:
+            signal.signal(number, previous)
+        os.kill(os.getpid(), signum)
+
+    for number in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if number is None:
+            continue
+        try:
+            installed.append((number, signal.signal(number, _terminate)))
+        except (ValueError, OSError):
+            continue  # not the main thread, or no such signal on this platform
+    try:
+        yield path
+    finally:
+        for number, previous in installed:
+            try:
+                signal.signal(number, previous)
+            except (ValueError, OSError):
+                pass
+        shutil.rmtree(path, ignore_errors=True)
+
+
 @contextmanager
 def _doctor_runtime(plugin_path: Path):
     """Load one plugin through the real runtime and restore global state.
@@ -40,46 +225,76 @@ def _doctor_runtime(plugin_path: Path):
     test framework. Registration code executes under a temporary HERMES_HOME
     with outbound socket connects blocked.
     """
-    temporary_home = tempfile.TemporaryDirectory(prefix="hermes-plugin-doctor-")
-    stack = ExitStack()
-    home = Path(temporary_home.name)
-    bundled = home / "bundled-plugins"
-    plugins_root = home / "plugins"
-    bundled.mkdir(parents=True)
-    plugins_root.mkdir(parents=True)
-    copied = plugins_root / plugin_path.name
-    shutil.copytree(
-        plugin_path,
-        copied,
-        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache", "*.pyc"),
-    )
-
-    stack.enter_context(
-        patch.dict(
-            os.environ,
-            {
-                "HERMES_HOME": str(home),
-                "HERMES_BUNDLED_PLUGINS": str(bundled),
-                "HERMES_ENABLE_PROJECT_PLUGINS": "0",
-            },
-            clear=False,
+    discovered = _discover_manifests(plugin_path)
+    if not discovered:
+        raise _DoctorLoadError(
+            f"{plugin_path} holds no {' / '.join(_MANIFEST_FILENAMES)} manifest, "
+            "here or one level down — Plugin Doctor validates one plugin "
+            "directory, not a parent tree; point it at the plugin itself"
         )
-    )
-    stack.enter_context(patch.object(socket, "create_connection", _deny_network))
-    stack.enter_context(patch.object(socket.socket, "connect", _deny_network))
-    stack.enter_context(patch.object(socket.socket, "connect_ex", _deny_network))
+    if len(discovered) > 1:
+        raise _DoctorLoadError(
+            f"{plugin_path} holds more than one plugin manifest — Plugin Doctor "
+            "validates one plugin at a time; point it at a single plugin directory"
+        )
+    copy_bytes, copy_files = _measure_copy(plugin_path)
+    if copy_bytes > MAX_COPY_BYTES or copy_files > MAX_COPY_FILES:
+        raise _DoctorLoadError(
+            f"{plugin_path} holds {copy_bytes / 1024 ** 2:.0f} MiB in {copy_files} "
+            f"file(s), over the Doctor scratch-copy limit of "
+            f"{MAX_COPY_BYTES / 1024 ** 2:.0f} MiB / {MAX_COPY_FILES} files — "
+            "a plugin directory this large is usually a checkout; remove build "
+            "output and data directories from it before validating"
+        )
 
-    from hermes_cli.plugins import PluginManager
-    from tools.registry import registry
+    # Setup runs inside the stack from here on: a failure while copying or
+    # patching must still drop the scratch dir, which the old code left to the
+    # TemporaryDirectory finalizer.
+    stack = ExitStack()
+    try:
+        home = stack.enter_context(_doctor_scratch_dir())
+        bundled = home / "bundled-plugins"
+        plugins_root = home / "plugins"
+        bundled.mkdir(parents=True)
+        plugins_root.mkdir(parents=True)
+        copied = plugins_root / plugin_path.name
+        shutil.copytree(
+            plugin_path,
+            copied,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(*_COPY_IGNORE_PATTERNS),
+        )
 
-    entries_before = {entry.name: entry for entry in registry._snapshot_entries()}
-    policy_before = dict(registry._plugin_override_policy)
-    modules_before = {
-        name
-        for name in sys.modules
-        if name == "hermes_plugins" or name.startswith("hermes_plugins.")
-    }
-    manager = PluginManager()
+        stack.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(home),
+                    "HERMES_BUNDLED_PLUGINS": str(bundled),
+                    "HERMES_ENABLE_PROJECT_PLUGINS": "0",
+                },
+                clear=False,
+            )
+        )
+        stack.enter_context(patch.object(socket, "create_connection", _deny_network))
+        stack.enter_context(patch.object(socket.socket, "connect", _deny_network))
+        stack.enter_context(patch.object(socket.socket, "connect_ex", _deny_network))
+
+        from hermes_cli.plugins import PluginManager
+        from tools.registry import registry
+
+        entries_before = {entry.name: entry for entry in registry._snapshot_entries()}
+        policy_before = dict(registry._plugin_override_policy)
+        modules_before = {
+            name
+            for name in sys.modules
+            if name == "hermes_plugins" or name.startswith("hermes_plugins.")
+        }
+        manager = PluginManager()
+    except BaseException:
+        stack.close()
+        raise
+
     try:
         manifests = manager._scan_directory(plugins_root, source="user")
         if not manifests:
@@ -130,7 +345,6 @@ def _doctor_runtime(plugin_path: Path):
             ):
                 sys.modules.pop(name, None)
         stack.close()
-        temporary_home.cleanup()
 
 
 @dataclass(frozen=True)
@@ -362,4 +576,5 @@ __all__ = [
     "DoctorReport",
     "doctor_plugin",
     "resolve_plugin_path",
+    "sweep_stale_doctor_tempdirs",
 ]
