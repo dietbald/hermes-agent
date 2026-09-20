@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_real_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 from agent.secret_scope import get_secret as _get_secret
@@ -1085,7 +1085,10 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    # Hermes profiles may intentionally scope HOME to
+    # ``{HERMES_HOME}/home``. Claude Code credentials are user-level state,
+    # so resolve them against the OS account home instead of the profile home.
+    cred_path = Path(get_real_home()) / ".claude" / ".credentials.json"
     if not cred_path.exists():
         return None
     try:
@@ -1294,7 +1297,9 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    # Keep refresh writes beside the user-level file that the read path uses,
+    # even when a Hermes profile has overridden HOME.
+    cred_path = Path(get_real_home()) / ".claude" / ".credentials.json"
     try:
         # Read existing file to preserve other fields
         existing = {}
