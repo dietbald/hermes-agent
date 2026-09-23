@@ -1089,7 +1089,7 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
-DEFAULT_MAX_ITERATIONS = 250
+DEFAULT_MAX_ITERATIONS = 1000
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
@@ -1904,6 +1904,7 @@ def _build_child_agent(
     child_provider_data_collection = getattr(
         parent_agent, "provider_data_collection", None
     ) or ""
+    child_provider_zdr = getattr(parent_agent, "provider_zdr", False) is True
     child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
     if override_provider:
         child_providers_allowed = None
@@ -1912,6 +1913,7 @@ def _build_child_agent(
         child_provider_sort = None
         child_provider_require_parameters = False
         child_provider_data_collection = ""
+        child_provider_zdr = False
         # Note: openrouter_min_coding_score is model-gated (only emitted on
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
@@ -1993,6 +1995,7 @@ def _build_child_agent(
                 provider_sort=child_provider_sort,
                 provider_require_parameters=child_provider_require_parameters,
                 provider_data_collection=child_provider_data_collection,
+                provider_zdr=child_provider_zdr,
                 request_overrides=(
                     dict(override_request_overrides or {})
                     if override_provider

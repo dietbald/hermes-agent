@@ -174,6 +174,13 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_pins_selected_model(self):
+        client = FakeClient()
+        s = make_session(client, model="gpt-5.3-codex-spark")
+        s.ensure_started()
+        method, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["model"] == "gpt-5.3-codex-spark"
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -895,4 +902,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

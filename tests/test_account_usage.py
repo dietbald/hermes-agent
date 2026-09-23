@@ -201,3 +201,54 @@ def test_fetch_account_usage_openrouter_omits_quota_window_when_key_has_no_limit
     assert snapshot.windows == ()
     assert "Credits balance: $74.50" in snapshot.details
     assert "API key usage: $25.50 total • $1.25 today • $4.50 this week • $18.00 this month" in snapshot.details
+
+
+def _anthropic_usage(monkeypatch, payload):
+    """Run the Anthropic OAuth usage path against a canned API payload."""
+    monkeypatch.setattr("agent.account_usage.resolve_runtime_provider", lambda: "anthropic")
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda **kw: "oauth-token")
+    monkeypatch.setattr("agent.account_usage._is_oauth_token", lambda token: True)
+    monkeypatch.setattr("agent.account_usage.httpx.Client", lambda **kw: _Client(payload))
+    return fetch_account_usage(provider="anthropic")
+
+
+def test_anthropic_utilization_is_a_percent_not_a_fraction(monkeypatch):
+    """utilization=1.0 means 1% used, not 100%.
+
+    The old heuristic `util * 100 if util <= 1 else util` reported a real
+    1%-used week as "0% remaining (100% used)" and a real 0.5% as 50%.
+    Live API on 2026-09-20 returned five_hour=4.0, seven_day=1.0 while both
+    windows were nearly empty. (TJ, 2026-09-20)
+    """
+    snapshot = _anthropic_usage(
+        monkeypatch,
+        {"five_hour": {"utilization": 4.0, "resets_at": "2026-09-20T14:00:00+00:00"},
+         "seven_day": {"utilization": 1.0, "resets_at": "2026-09-27T09:00:00+00:00"}},
+    )
+    windows = {w.label: w.used_percent for w in snapshot.windows}
+    assert windows["Current session"] == 4.0
+    assert windows["Current week"] == 1.0
+
+    lines = render_account_usage_lines(snapshot)
+    text = "\n".join(lines)
+    assert "Current session: 96% remaining (4% used)" in text
+    assert "Current week: 99% remaining (1% used)" in text
+    assert "0% remaining" not in text
+
+
+def test_anthropic_sub_one_percent_is_not_inflated(monkeypatch):
+    """0.5 is half a percent used, not half the quota."""
+    snapshot = _anthropic_usage(monkeypatch, {"five_hour": {"utilization": 0.5}})
+    assert snapshot.windows[0].used_percent == 0.5
+    assert "Current session: 100% remaining (0% used)" in "\n".join(
+        render_account_usage_lines(snapshot)
+    )
+
+
+def test_anthropic_full_usage_still_reads_as_exhausted(monkeypatch):
+    """A genuinely exhausted window (100.0) must still show 0% remaining."""
+    snapshot = _anthropic_usage(monkeypatch, {"five_hour": {"utilization": 100.0}})
+    assert snapshot.windows[0].used_percent == 100.0
+    assert "Current session: 0% remaining (100% used)" in "\n".join(
+        render_account_usage_lines(snapshot)
+    )

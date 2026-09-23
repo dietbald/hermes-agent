@@ -830,6 +830,18 @@ class TestProviderRouting:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["extra_body"]["provider"]["sort"] == "throughput"
 
+    def test_zdr_true_is_forwarded(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_zdr = True
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["provider"]["zdr"] is True
+
+    def test_zdr_non_boolean_is_not_forwarded(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_zdr = "true"
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "zdr" not in kwargs.get("extra_body", {}).get("provider", {})
+
 
 
 
@@ -919,6 +931,5 @@ class TestReasoningEffortDefaults:
                             base_url="https://chatgpt.com/backend-api/codex")
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["reasoning"]["effort"] == "medium"
-
 
 

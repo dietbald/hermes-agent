@@ -57,6 +57,7 @@ def _make_agent_stub(agent_cls):
     agent.provider_sort = "throughput"
     agent.provider_require_parameters = False
     agent.provider_data_collection = None
+    agent.provider_zdr = True
     return agent
 
 
@@ -234,6 +235,7 @@ def test_review_fork_inherits_prefill_and_provider_routing():
     ), "fork prefill aliases the parent's dicts (needs deepcopy)"
     assert init_kwargs.get("providers_allowed") == agent.providers_allowed
     assert init_kwargs.get("provider_sort") == agent.provider_sort
+    assert init_kwargs.get("provider_zdr") == agent.provider_zdr
 
 
 def test_review_fork_pins_session_start_and_session_id():
@@ -335,6 +337,7 @@ def test_routed_review_fork_does_not_inherit_reasoning_config():
         "prefill_messages",
         "providers_allowed",
         "provider_sort",
+        "provider_zdr",
     ):
         assert _gated not in init_kwargs, (
             f"Routed review fork was passed parent-only kwarg {_gated!r}; "

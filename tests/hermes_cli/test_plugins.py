@@ -507,6 +507,96 @@ class TestPluginLoading:
         assert entry.module is None
         assert "exclusive" in (entry.error or "").lower()
 
+    def test_user_cron_provider_auto_coerced_to_exclusive(self, tmp_path, monkeypatch):
+        """User-installed cron providers must NOT be loaded by the general
+        PluginManager — they belong to plugins/cron_providers discovery.
+
+        Regression test for TJS-148:
+            'PluginContext' object has no attribute 'register_cron_scheduler'
+
+        Same contract as the memory-provider case above: a plugin whose
+        ``__init__.py`` calls ``ctx.register_cron_scheduler`` is auto-detected
+        as ``kind: exclusive``, so the general loader records the manifest but
+        never imports/register()s it. Real activation happens through
+        ``plugins/cron_providers/__init__.py`` via ``cron.provider`` config.
+        """
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = plugins_dir / "tickwatch"
+        plugin_dir.mkdir(parents=True)
+        # No explicit `kind:` — the heuristic should kick in.
+        (plugin_dir / "plugin.yaml").write_text(yaml.dump({"name": "tickwatch"}))
+        (plugin_dir / "__init__.py").write_text(
+            "class TickwatchScheduler:\n"
+            "    pass\n"
+            "def register(ctx):\n"
+            "    ctx.register_cron_scheduler(TickwatchScheduler())\n"
+        )
+        hermes_home = tmp_path / "hermes_test"
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["tickwatch"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "tickwatch" in mgr._plugins
+        entry = mgr._plugins["tickwatch"]
+        assert entry.manifest.kind == "exclusive", (
+            f"Expected auto-coerced kind='exclusive', got {entry.manifest.kind}"
+        )
+        # Not loaded by general manager (no register() call, no AttributeError).
+        assert not entry.enabled
+        assert entry.module is None
+        assert "exclusive" in (entry.error or "").lower()
+
+    def test_bundled_cron_providers_dir_not_scanned_as_plugins(self):
+        """``plugins/cron_providers/`` has its own discovery system.
+
+        Bundled cron providers (e.g. chronos) must not surface as ordinary
+        bundled plugins the general PluginManager can be asked to enable —
+        that is the path that produced the ``register_cron_scheduler``
+        AttributeError in TJS-148.
+        """
+        mgr = PluginManager()
+        manifests = mgr._collect_directory_manifests()
+        offenders = [
+            m for m in manifests
+            if m.source == "bundled" and "cron_providers" in (m.path or "")
+        ]
+        assert not offenders, (
+            "bundled cron providers leaked into general plugin discovery: "
+            f"{[m.key for m in offenders]}"
+        )
+
+    def test_plugin_context_register_cron_scheduler_is_inert(self, monkeypatch):
+        """``PluginContext.register_cron_scheduler`` exists and is inert.
+
+        A cron provider that still reaches the general loader (explicit
+        ``kind: standalone``, say) must not die on a missing attribute. The
+        call records the provider and does nothing else; a non-CronScheduler
+        argument is warned about and ignored.
+        """
+        from cron.scheduler_provider import CronScheduler
+        from hermes_cli.plugins import PluginContext, PluginManifest
+
+        class Dummy(CronScheduler):
+            name = "dummy"
+
+            def start(self, stop_event, **kwargs):
+                return None
+
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="dummy-cron"), mgr)
+
+        provider = Dummy()
+        ctx.register_cron_scheduler(provider)
+        assert ctx._cron_scheduler is provider
+
+        # Wrong type is ignored, not raised.
+        ctx.register_cron_scheduler(object())
+        assert ctx._cron_scheduler is provider
+
     def test_entrypoint_memory_provider_auto_coerced_to_exclusive(
         self, tmp_path, monkeypatch
     ):

@@ -1081,7 +1081,7 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
-            max_iterations=15,
+            max_iterations=1000,
             enabled_toolsets=["feishu_doc", "feishu_drive"],
         )
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",

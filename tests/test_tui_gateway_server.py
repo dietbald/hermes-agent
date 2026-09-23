@@ -16841,6 +16841,7 @@ class _FakeAgentForBackground:
     provider_sort = None
     provider_require_parameters = False
     provider_data_collection = None
+    provider_zdr = False
     reasoning_config = None
     service_tier = None
     request_overrides = {}

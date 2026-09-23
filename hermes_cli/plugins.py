@@ -988,13 +988,19 @@ def _detect_kind_from_source(source_text: str) -> Optional[str]:
     Mirrors ``plugins/memory/__init__.py:_is_memory_provider_dir``: a
     module that registers a memory provider (``register_memory_provider``
     or ``MemoryProvider``) belongs to the memory-provider discovery
-    system (``exclusive``); a module that registers a model provider
-    (``register_provider`` + ``ProviderProfile``) belongs to the
-    providers discovery (``model-provider``). Applied to both directory
-    plugins and pip entry-point plugins so neither is eagerly imported
-    by the general PluginManager.
+    system (``exclusive``); a module that registers a cron scheduler
+    (``register_cron_scheduler`` or ``CronScheduler``) belongs to the
+    cron-provider discovery system (also ``exclusive``), mirroring
+    ``plugins/cron_providers/__init__.py:_is_cron_provider_dir``; a module
+    that registers a model provider (``register_provider`` +
+    ``ProviderProfile``) belongs to the providers discovery
+    (``model-provider``). Applied to both directory plugins and pip
+    entry-point plugins so neither is eagerly imported by the general
+    PluginManager.
     """
     if "register_memory_provider" in source_text or "MemoryProvider" in source_text:
+        return "exclusive"
+    if "register_cron_scheduler" in source_text or "CronScheduler" in source_text:
         return "exclusive"
     if "register_provider" in source_text and "ProviderProfile" in source_text:
         return "model-provider"
@@ -2387,6 +2393,39 @@ class PluginContext:
         self._memory_provider = provider
         logger.debug(
             "Plugin '%s' registered memory provider: %s",
+            self.manifest.name, getattr(provider, "name", "?"),
+        )
+
+    # -- cron scheduler provider registration -------------------------------
+
+    def register_cron_scheduler(self, provider) -> None:
+        """Register a cron scheduler provider.
+
+        Same shape as :meth:`register_memory_provider`: cron providers are
+        activated exclusively, by name, through ``cron.provider`` in
+        config.yaml, and ``plugins/cron_providers/__init__.py`` owns that path
+        with its own collector. A provider reaching *this* implementation is
+        one the general PluginManager loaded — it was not classified
+        ``exclusive`` — so the call is recorded and otherwise inert. Without
+        it, such a plugin's ``register()`` dies on a missing attribute and the
+        plugin fails to load at all (the bundled ``chronos`` provider hit
+        exactly that under ``plugins doctor``).
+
+        The provider must be an instance of
+        ``cron.scheduler_provider.CronScheduler``.
+        """
+        from cron.scheduler_provider import CronScheduler
+
+        if not isinstance(provider, CronScheduler):
+            logger.warning(
+                "Plugin '%s' tried to register a cron scheduler that does not "
+                "inherit from CronScheduler. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        self._cron_scheduler = provider
+        logger.debug(
+            "Plugin '%s' registered cron scheduler: %s",
             self.manifest.name, getattr(provider, "name", "?"),
         )
 
@@ -4413,7 +4452,13 @@ class PluginManager:
         bundled = self._scan_directory(
             repo_plugins,
             source="bundled",
-            skip_names={"memory", "context_engine", "platforms", "model-providers"},
+            skip_names={
+                "memory",
+                "cron_providers",
+                "context_engine",
+                "platforms",
+                "model-providers",
+            },
         )
         logger.debug("  bundled (top-level): %d manifest(s)", len(bundled))
         manifests.extend(bundled)
@@ -4647,13 +4692,15 @@ class PluginManager:
                 )
                 kind = "standalone"
 
-            # Auto-coerce user-installed memory providers to kind="exclusive"
-            # so they're routed to plugins/memory discovery instead of being
-            # loaded by the general PluginManager (whose PluginContext
-            # register_memory_provider is a recorded no-op, not an
-            # activation path). Mirrors the heuristic in
-            # plugins/memory/__init__.py:_is_memory_provider_dir.
-            # Bundled memory providers are already skipped via skip_names.
+            # Auto-coerce user-installed memory and cron providers to
+            # kind="exclusive" so they're routed to plugins/memory and
+            # plugins/cron_providers discovery instead of being loaded by the
+            # general PluginManager (whose PluginContext
+            # register_memory_provider / register_cron_scheduler are recorded
+            # no-ops, not activation paths). Mirrors the heuristics in
+            # plugins/memory/__init__.py:_is_memory_provider_dir and
+            # plugins/cron_providers/__init__.py:_is_cron_provider_dir.
+            # Bundled providers of both kinds are skipped via skip_names.
             if kind == "standalone" and "kind" not in data:
                 init_file = plugin_dir / "__init__.py"
                 if init_file.exists():

@@ -27,6 +27,7 @@ provider_routing:
   order: []               # Explicit provider priority order
   require_parameters: false  # Only use providers that support all parameters
   data_collection: null   # Control data collection ("allow" or "deny")
+  zdr: false              # Require a zero-data-retention endpoint
 ```
 
 :::info
@@ -100,6 +101,19 @@ Controls whether providers can use your prompts for training. Options are `"allo
 ```yaml
 provider_routing:
   data_collection: "deny"
+```
+
+### `zdr`
+
+When `true`, only OpenRouter endpoints that support zero data retention are
+eligible. Use this for sensitive prompts where provider-side retention is not
+acceptable. If no endpoint for the selected model satisfies the requirement,
+OpenRouter rejects the request instead of weakening the policy.
+
+```yaml
+provider_routing:
+  data_collection: "deny"
+  zdr: true
 ```
 
 ## Practical Examples

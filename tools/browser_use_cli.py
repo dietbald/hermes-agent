@@ -840,7 +840,13 @@ _HEADER_BASE = (
     "Batch each sub-procedure (navigate, wait, extract, act) into one call "
     "— do not spend a call per action — but for long extractions prefer "
     "several medium calls that append to workspace files over one giant "
-    "call, so progress survives timeouts."
+    "call, so progress survives timeouts.\n\n"
+    "CLEAN UP YOUR TABS: every profile on this host shares ONE Chromium, and "
+    "an abandoned tab is a leaked renderer process — 109 of them once drove "
+    "this box to 85% swap. close_tab() is pre-imported next to new_tab(). "
+    "Close every tab you opened before your last call on a task returns, "
+    "including on failure paths; close each one if you opened several. Do not "
+    "keep a tab open 'in case you need it again' — reopening is cheap."
 )
 
 _HEADER_VISION = (

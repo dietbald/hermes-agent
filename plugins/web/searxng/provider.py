@@ -44,6 +44,27 @@ def _searxng_url() -> str:
     return (val or "").strip()
 
 
+def _dead_engines(data: Dict[str, Any]) -> list[str]:
+    """Return ``"engine (reason)"`` for every engine SearXNG could not reach.
+
+    SearXNG answers HTTP 200 with ``results: []`` when its upstream engines are
+    rate-limited or CAPTCHA-walled, which is byte-for-byte indistinguishable
+    from a genuine zero-hit search at the tool's output level. The only signal
+    is ``unresponsive_engines``: a list of ``[engine, reason]`` pairs (a third
+    element appears on some versions).
+    """
+    entries = data.get("unresponsive_engines") or []
+    dead: list[str] = []
+    for entry in entries:
+        if isinstance(entry, (list, tuple)) and entry:
+            name = str(entry[0])
+            reason = str(entry[1]) if len(entry) > 1 and entry[1] else ""
+            dead.append(f"{name} ({reason})" if reason else name)
+        elif entry:
+            dead.append(str(entry))
+    return dead
+
+
 class SearXNGWebSearchProvider(WebSearchProvider):
     """Search via a user-hosted SearXNG instance."""
 
@@ -110,6 +131,7 @@ class SearXNGWebSearchProvider(WebSearchProvider):
             }
 
         raw_results = data.get("results", [])
+        dead_engines = _dead_engines(data)
 
         # SearXNG may return a score field; sort descending and cap to limit.
         sorted_results = sorted(
@@ -129,14 +151,39 @@ class SearXNGWebSearchProvider(WebSearchProvider):
         ]
 
         logger.info(
-            "SearXNG search '%s': %d results (from %d raw, limit %d)",
+            "SearXNG search '%s': %d results (from %d raw, limit %d)%s",
             query,
             len(web_results),
             len(raw_results),
             limit,
+            f", dead engines: {', '.join(dead_engines)}" if dead_engines else "",
         )
 
-        return {"success": True, "data": {"web": web_results}}
+        # No results AND dead engines is a backend failure, not an empty
+        # search: report it as one so the caller cannot read it as "the web
+        # has nothing on this" (#TJS-211). Returning success=False also lets
+        # the keyless rescue ring in tools/web_tools.py serve this call.
+        if dead_engines and not raw_results:
+            return {
+                "success": False,
+                "error": (
+                    "SearXNG returned no results because every upstream engine "
+                    f"failed: {', '.join(dead_engines)}. This is a backend "
+                    "outage, not evidence that no results exist."
+                ),
+            }
+
+        data_out: Dict[str, Any] = {"web": web_results}
+        if dead_engines:
+            # Partial coverage: keep the results but mark them incomplete,
+            # reusing the annotation key the rescue path already sets.
+            data_out["backend_error"] = (
+                "Degraded search: these SearXNG engines failed and their "
+                f"results are missing: {', '.join(dead_engines)}. Coverage is "
+                "incomplete; absence of a result here is not evidence of absence."
+            )
+
+        return {"success": True, "data": data_out}
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {

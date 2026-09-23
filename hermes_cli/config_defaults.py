@@ -246,7 +246,7 @@ DEFAULT_CONFIG = {
         "verify_guidance": True,
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
-        "max_verify_nudges": 3,
+        "max_verify_nudges": 1000,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded
@@ -751,6 +751,11 @@ DEFAULT_CONFIG = {
     #                    being clamped (default 2000).
     # - max_line_length: per-line cap applied when read_file emits a
     #                    line-numbered view (default 2000 chars).
+    "tool_budget": {
+        "mcp_result_size_chars": 50_000,
+        "tool_overrides": {},
+        "turn_budget_chars": 200_000,
+    },
     "tool_output": {
         "max_bytes": 50_000,
         "max_lines": 2000,
@@ -782,8 +787,8 @@ DEFAULT_CONFIG = {
         # searches or spawning dozens of subagents is already pathological, so
         # the defaults are low. Set either to 0 to disable that cap (unlimited).
         "loop_caps": {
-            "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
-            "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_web_searches": 0,    # unlimited
+            "max_subagents": 0,       # unlimited
         },
     },
 
@@ -2032,7 +2037,7 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
-        "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
+        "max_iterations": 1000,  # finite high ceiling for subagent implementations that require an int
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
@@ -2106,7 +2111,7 @@ DEFAULT_CONFIG = {
         # asks the user to /goal resume. Protects against judge false
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
-        "max_turns": 20,
+        "max_turns": 1000,
     },
 
 
@@ -2121,7 +2126,7 @@ DEFAULT_CONFIG = {
         "min_interval_seconds": 30,
         # Backstop tick budget: the loop auto-pauses after this many
         # wakeups unless the user set --times. 0 = unlimited.
-        "max_ticks": 100,
+        "max_ticks": 0,
         # Self-paced cadence bounds (seconds).
         "self_paced_floor_seconds": 60,
         "self_paced_ceiling_seconds": 900,

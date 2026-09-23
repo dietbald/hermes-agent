@@ -6716,6 +6716,10 @@ class BasePlatformAdapter(ABC):
                                     mark_failed,
                                     _obligation_id,
                                     _delivery_error,
+                                    retryable=bool(
+                                        getattr(result, "retryable", False)
+                                    ),
+                                    retry_after=getattr(result, "retry_after", None),
                                 )
                                 # A replacement can finish reconnecting before
                                 # this in-flight failure reaches mark_failed. In

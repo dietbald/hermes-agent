@@ -32,8 +32,9 @@ sends):
   retry boundary. Also carries the marker.
 - ``delivered``   — nothing to do; retention prunes.
 
-Poison rows cannot spin: attempts are capped, stale rows expire, and both
-transition to ``abandoned`` (kept briefly for inspection, then pruned).
+Non-retryable poison rows cannot spin: attempts are capped, stale rows expire,
+and both transition to ``abandoned`` (kept briefly for inspection, then pruned).
+Transient failures remain durable until delivery or explicit cancellation.
 
 Everything here is best-effort by design: ledger failures must never block
 or delay an actual send. Callers wrap every call in try/except.
@@ -45,6 +46,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -64,6 +66,8 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+ALERT_AFTER_FAILURES = 3
+_RETRY_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0, 120.0, 300.0)
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -85,6 +89,13 @@ RECONNECTED_MARKER = (
 # (blocked bot, bad auth, missing chat) must not be retried merely because an
 # adapter reconnected.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
+
+_TRANSIENT_DELIVERY_RE = re.compile(
+    r"(timed?\s*out|timeout|flood[_\s-]*control|retry\s+(?:in|after)|"
+    r"\b429\b|too\s+many\s+requests|connection|network|temporar|"
+    r"send_path_degraded|server\s+error|\b5\d\d\b)",
+    re.IGNORECASE,
+)
 
 
 def _db_path():
@@ -124,7 +135,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            retryable INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            cancelled_at REAL
         )"""
     )
     columns = {
@@ -137,6 +152,21 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             )
         except sqlite3.OperationalError as exc:
             # Concurrent first-use connections can both observe the old schema.
+            if "duplicate column" not in str(exc).lower():
+                raise
+    for name, ddl in (
+        ("retryable", "INTEGER NOT NULL DEFAULT 0"),
+        ("failure_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at", "REAL"),
+        ("cancelled_at", "REAL"),
+    ):
+        if name in columns:
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {ddl}"
+            )
+        except sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
 
@@ -263,11 +293,129 @@ def mark_attempting(obligation_id: str) -> None:
 
 
 def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='delivered', updated_at=?, last_error=NULL,
+                   retryable=0, next_attempt_at=NULL
+               WHERE obligation_id=?""",
+            (time.time(), obligation_id),
+        )
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+def is_retryable_delivery_failure(error: str = "", *, explicit: bool = False) -> bool:
+    """Return whether an outbound delivery failure belongs in the durable retry loop.
+
+    Adapter ``retryable`` metadata wins.  The text fallback deliberately covers
+    Telegram's ambiguous read timeouts as well as 429/FloodWait: an ACK may have
+    been lost, so replay carries the visible recovered-reply marker rather than
+    silently dropping the reply.
+    """
+    return bool(explicit or _TRANSIENT_DELIVERY_RE.search(str(error or "")))
+
+
+def _retry_delay(failure_count: int, retry_after: Optional[float]) -> float:
+    if retry_after is not None:
+        try:
+            return max(0.0, min(float(retry_after), 24 * 60 * 60))
+        except (TypeError, ValueError):
+            pass
+    index = max(0, min(failure_count - 1, len(_RETRY_BACKOFF_SECONDS) - 1))
+    return _RETRY_BACKOFF_SECONDS[index]
+
+
+def _surface_delivery_alert(
+    obligation_id: str,
+    *,
+    failure_count: int,
+    error: str,
+) -> None:
+    """Expose a Telegram-independent operator alert after repeated failures."""
+    logger.error(
+        "DELIVERY NEEDS ATTENTION: obligation %s failed %d times and will keep "
+        "retrying until delivered or explicitly cancelled: %s",
+        obligation_id,
+        failure_count,
+        error or "send failed",
+    )
+    try:
+        path = get_hermes_home() / "logs" / "delivery_alerts.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "at": time.time(),
+            "obligation_id": obligation_id,
+            "failure_count": failure_count,
+            "error": (error or "send failed")[:500],
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("delivery alert file write failed", exc_info=True)
+
+
+def mark_failed(
+    obligation_id: str,
+    error: str = "",
+    *,
+    retryable: bool = False,
+    retry_after: Optional[float] = None,
+) -> int:
+    """Persist a failure and arm durable retry when it is transient.
+
+    Returns the cumulative failure count. Retryable rows have no attempt or age
+    ceiling: they remain obligations until delivery or ``cancel_obligation``.
+    """
+    retryable = is_retryable_delivery_failure(error, explicit=retryable)
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        prior = conn.execute(
+            "SELECT failure_count FROM delivery_obligations WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone()
+        failure_count = int(prior[0] or 0) + 1 if prior else 1
+        next_attempt_at = (
+            now
+            if retryable and str(error or "").strip().lower() == "send_path_degraded"
+            else now + _retry_delay(failure_count, retry_after)
+            if retryable
+            else None
+        )
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', updated_at=?, last_error=?, retryable=?,
+                   failure_count=?, next_attempt_at=?
+               WHERE obligation_id=? AND state != 'cancelled'""",
+            (
+                now,
+                error[:500] if error else None,
+                1 if retryable else 0,
+                failure_count,
+                next_attempt_at,
+                obligation_id,
+            ),
+        )
+    if retryable and failure_count == ALERT_AFTER_FAILURES:
+        _surface_delivery_alert(
+            obligation_id,
+            failure_count=failure_count,
+            error=error,
+        )
+    return failure_count
+
+
+def cancel_obligation(obligation_id: str) -> bool:
+    """Explicitly cancel an undelivered obligation so it will never retry."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='cancelled', retryable=0, next_attempt_at=NULL,
+                   cancelled_at=?, updated_at=?
+               WHERE obligation_id=?
+                 AND state IN ('pending', 'attempting', 'failed')""",
+            (now, now, obligation_id),
+        )
+    return bool(cursor.rowcount)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -339,21 +487,29 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile
+                      owner_pid, owner_started_at, adapter_profile, retryable,
+                      next_attempt_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
-             adapter_profile) in rows:
+             adapter_profile, retryable, next_attempt_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+            # Transient send failures remain obligations until delivered or
+            # explicitly cancelled. Legacy pending/ambiguous rows retain their
+            # bounded poison-row recovery contract.
+            if not retryable and (
+                attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS
+            ):
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""",
                     (now, oid),
                 )
+                continue
+            if retryable and next_attempt_at is not None and now < next_attempt_at:
                 continue
             if (
                 deliverable_platforms is not None
@@ -430,7 +586,8 @@ def sweep_failed_for_runtime(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile
+                      owner_started_at, last_error, adapter_profile, retryable,
+                      next_attempt_at, failure_count
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""",
             (platform,),
@@ -448,6 +605,9 @@ def sweep_failed_for_runtime(
             owner_started_at,
             last_error,
             adapter_profile,
+            retryable,
+            next_attempt_at,
+            failure_count,
         ) in rows:
             expected_profile = (
                 "default" if not profile or profile == "default" else str(profile)
@@ -458,17 +618,13 @@ def sweep_failed_for_runtime(
             # process-start matching prevents PID reuse from stealing work.
             if owner_pid != pid or owner_started_at != started:
                 continue
-            if str(last_error or "").strip().lower() not in _RUNTIME_RETRYABLE_ERRORS:
+            legacy_retryable = (
+                str(last_error or "").strip().lower() in _RUNTIME_RETRYABLE_ERRORS
+            )
+            if not retryable and not legacy_retryable:
                 continue
             owner_guard = (oid, owner_pid, owner_started_at)
-            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
-                conn.execute(
-                    """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=?
-                       WHERE obligation_id=? AND state='failed'
-                         AND owner_pid IS ? AND owner_started_at IS ?""",
-                    (now, *owner_guard),
-                )
+            if next_attempt_at is not None and now < next_attempt_at:
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
@@ -490,6 +646,7 @@ def sweep_failed_for_runtime(
                     "profile": adapter_profile,
                     "runtime_recovery": True,
                     "attempts": attempts + 1,
+                    "failure_count": failure_count,
                 })
     return claimed
 
@@ -501,7 +658,8 @@ def _prune(now: Optional[float] = None) -> None:
         with _transaction() as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
-                   WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
+                   WHERE state IN ('delivered', 'abandoned', 'cancelled')
+                     AND updated_at < ?""",
                 (cutoff,),
             )
             total = conn.execute(
@@ -512,10 +670,12 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
+                         WHERE state IN ('delivered', 'abandoned', 'cancelled')
                          ORDER BY CASE state
                                     WHEN 'delivered' THEN 0
                                     WHEN 'abandoned' THEN 1
-                                    ELSE 2
+                                    WHEN 'cancelled' THEN 2
+                                    ELSE 3
                                   END, updated_at ASC
                          LIMIT ?)""",
                     (excess,),

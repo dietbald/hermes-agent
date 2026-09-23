@@ -791,9 +791,9 @@ def _(rid, params: dict) -> dict:
 
         try:
             goals_cfg = _load_cfg().get("goals") or {}
-            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+            max_turns = int(goals_cfg.get("max_turns", 1000) or 1000)
         except Exception:
-            max_turns = 20
+            max_turns = 1000
         mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
 
         lower = arg.strip().lower()

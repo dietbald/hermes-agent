@@ -1876,14 +1876,21 @@ def _discover_all_plugins() -> list:
     """
     seen: dict = {}  # key -> (name, version, description, source, path, key)
 
-    # Bundled (<repo>/plugins/<name>/), excluding memory/, context_engine/
-    # and model-providers/ — model providers load through the dedicated
-    # provider registry (providers/__init__.py), not the general PluginManager
-    # opt-in surface, so listing them as toggleable plugins is misleading.
+    # Bundled (<repo>/plugins/<name>/), excluding memory/, cron_providers/,
+    # context_engine/ and model-providers/ — those categories load through
+    # their own discovery systems (providers/__init__.py,
+    # plugins/memory/__init__.py, plugins/cron_providers/__init__.py) and are
+    # activated by name via <category>.provider config, not the general
+    # PluginManager opt-in surface, so listing them as toggleable plugins is
+    # misleading.
     from hermes_cli.plugins import get_bundled_plugins_dir
     repo_plugins = get_bundled_plugins_dir()
     for base, source, skip in (
-        (repo_plugins, "bundled", {"memory", "context_engine", "model-providers"}),
+        (
+            repo_plugins,
+            "bundled",
+            {"memory", "cron_providers", "context_engine", "model-providers"},
+        ),
         (_plugins_dir(), "user", set()),
     ):
         _scan_level(base, source, skip, "", 0, seen)

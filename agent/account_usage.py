@@ -782,7 +782,12 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         util = window.get("utilization")
         if util is None:
             continue
-        used = float(util) * 100 if float(util) <= 1 else float(util)
+        # Anthropic's OAuth usage API reports utilization as a PERCENT
+        # (4.0 = 4% used), not a 0-1 fraction. The old heuristic
+        # "<= 1 means fraction, so x100" misread a real 1% week as 100%
+        # used / 0% remaining, and a real 0.5% as 50%. Trust the documented
+        # unit instead of guessing from magnitude. (TJ, 2026-09-20)
+        used = float(util)
         windows.append(
             AccountUsageWindow(
                 label=label,

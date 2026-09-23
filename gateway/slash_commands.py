@@ -4446,7 +4446,7 @@ class GatewaySlashCommandsMixin:
             tmp_agent = AIAgent(
                 **runtime_kwargs,
                 model=model,
-                max_iterations=4,
+                max_iterations=1000,
                 quiet_mode=True,
                 skip_memory=not _checkpoint_required,
                 enabled_toolsets=["memory"],

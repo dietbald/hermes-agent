@@ -1769,7 +1769,7 @@ def setup_terminal_backend(config: dict):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
-    config.setdefault("agent", {})["max_turns"] = 150
+    config.setdefault("agent", {})["max_turns"] = "unlimited"
     # config.yaml is the authoritative source for max_turns; the gateway
     # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
     # to .env to avoid the dual-source inconsistency that caused the
@@ -1806,11 +1806,11 @@ def setup_agent_settings(config: dict):
     # config.yaml is authoritative; read from there. If a legacy .env
     # entry is still around (from pre-PR#18413 setups), prefer the
     # config value so we don't surface a stale number to the user.
-    current_max = str(cfg_get(config, "agent", "max_turns", default=90))
+    current_max = str(cfg_get(config, "agent", "max_turns", default="unlimited"))
     print_info("Maximum tool-calling iterations per conversation.")
-    print_info("Higher = more complex tasks, but costs more tokens.")
+    print_info("Use unlimited unless a deliberately bounded test requires otherwise.")
     print_info(
-        f"Press Enter to keep {current_max}. Use 90 for most tasks or 150+ for open exploration."
+        f"Press Enter to keep {current_max}."
     )
 
     max_iter_str = prompt("Max iterations", current_max)
@@ -3520,7 +3520,7 @@ def _blank_slate_minimize_config(config: dict):
     Everything here is opt-in afterwards via ``hermes setup agent`` /
     ``hermes config set``. We keep only what's needed to run.
     """
-    config.setdefault("agent", {})["max_turns"] = 90
+    config.setdefault("agent", {})["max_turns"] = "unlimited"
 
     # Compression off — minimal footprint; user opts in if they want long sessions.
     config.setdefault("compression", {})["enabled"] = False

@@ -758,9 +758,13 @@ MCP tool results (tools named `mcp_*`) spill at a tighter **50,000-char** defaul
 ```yaml
 tool_budget:
   mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
+  tool_overrides: {}             # optional tool-name: positive character threshold
+  turn_budget_chars: 200000      # aggregate tool output before spillover
 ```
 
 The MCP threshold is always capped at the (possibly context-scaled) generic per-result threshold, so raising it cannot exceed what the active model's window allows.
+
+Named `tool_overrides` allow a profile to keep a complete large result inline for a specific tool, without changing other tools. Configure `turn_budget_chars` too if that result exceeds the aggregate limit. Both settings remain bounded by the active model's context window (15% per result, 30% per turn, using the existing character estimate). Other profiles retain their own settings. This does not disable context compression or grant additional tools.
 
 Hermes also flags **provider-side elision**: when an MCP or web tool result embeds its own truncation markers (`...N more items`, `"has_more": true`, "saved to sandbox" notes), a one-line notice is appended to the result warning that the visible data is incomplete and should be paged/fetched before treating any enumeration as complete.
 

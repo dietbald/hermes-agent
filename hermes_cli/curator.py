@@ -67,6 +67,7 @@ def _print_unmanaged_summary() -> None:
 
 def _cmd_status(args) -> int:
     from agent import curator
+    from agent.skill_utils import find_skill_name_collisions
     from tools import skill_usage
 
     state = curator.load_state()
@@ -110,6 +111,16 @@ def _cmd_status(args) -> int:
         f"  consolidate:    {'on' if curator.get_consolidate() else 'off'}"
         f"{'' if curator.get_consolidate() else ' (prune-only; LLM merge pass opt-in)'}"
     )
+
+    try:
+        collisions = find_skill_name_collisions()
+    except Exception:
+        collisions = []
+    print(f"  name conflicts: {len(collisions)} different-content collision(s)")
+    for collision in collisions[:10]:
+        print(f"    {collision['name']}: selected {collision['selected_path']}")
+        for entry in collision["entries"][1:]:
+            print(f"      conflicts with {entry['path']}")
 
     rows = skill_usage.curated_report()
     if not rows:

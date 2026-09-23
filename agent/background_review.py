@@ -202,7 +202,7 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
 # ---------------------------------------------------------------------------
 
 # Historical hardcoded iteration budget for the review fork.
-_REVIEW_MAX_ITERATIONS = 16
+_REVIEW_MAX_ITERATIONS = 1000
 
 # Default aggregate INPUT-token budget for one review fork (#93057). The
 # fork's first request replays the full snapshot — a warm prompt-cache read
@@ -1292,6 +1292,7 @@ def _run_review_in_thread(
                     "provider_sort",
                     "provider_require_parameters",
                     "provider_data_collection",
+                    "provider_zdr",
                 ):
                     _pref_val = getattr(agent, _pref_attr, None)
                     if _pref_val:

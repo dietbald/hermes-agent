@@ -164,6 +164,41 @@ class TestBudgetForContextWindow:
         assert budget_for_context_window(0) is DEFAULT_BUDGET
         assert budget_for_context_window(-5) is DEFAULT_BUDGET
 
+    def test_profile_override_preserves_large_tool_result_through_both_layers(self, tmp_path, monkeypatch):
+        from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
+        from agent.tool_executor import _budget_for_agent
+        from types import SimpleNamespace
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    evidence_reader: 300000\n  turn_budget_chars: 400000\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = _budget_for_agent(SimpleNamespace(context_compressor=SimpleNamespace(context_length=1000000)))
+        payload = "Complete transcript cue.\n" * 10000
+        result = maybe_persist_tool_result(payload, "evidence_reader", "read-1", config=cfg)
+        messages = [{"role": "tool", "content": result, "tool_call_id": "read-1"}]
+        enforce_turn_budget(messages, config=cfg)
+        assert messages[0]["content"] == payload
+        assert cfg.resolve_threshold("unconfigured_tool") == DEFAULT_RESULT_SIZE_CHARS
+        # Another profile must not inherit the exemption.
+        other = tmp_path / "other"; other.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(other))
+        assert budget_for_context_window(1000000).resolve_threshold("evidence_reader") == DEFAULT_RESULT_SIZE_CHARS
+
+    def test_profile_overrides_still_protect_small_context_models(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    evidence_reader: 300000\n  turn_budget_chars: 400000\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(65536)
+        assert cfg.resolve_threshold("evidence_reader") < 65536 * 4 * .16
+        assert cfg.turn_budget < 65536 * 4 * .31
+
+    def test_malformed_named_overrides_are_ignored(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  tool_overrides:\n    negative: -1\n    boolean: true\n    text: unlimited\n  turn_budget_chars: invalid\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert not cfg.tool_overrides
+        assert cfg.turn_budget == DEFAULT_TURN_BUDGET_CHARS
+
 
     def test_scaled_budget_constrains_oversized_result(self):
         """A 279K-char result against a 65K model exceeds the scaled per-result

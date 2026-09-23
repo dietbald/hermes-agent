@@ -576,6 +576,8 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
         preferences["require_parameters"] = True
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
+    if getattr(agent, "provider_zdr", False) is True:
+        preferences["zdr"] = True
     return preferences
 
 

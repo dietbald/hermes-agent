@@ -6,6 +6,7 @@ tool registration or provider resolution.
 """
 
 import ast
+import hashlib
 import logging
 import os
 import re
@@ -813,6 +814,50 @@ def get_scan_ordered_skills_dirs() -> List[Path]:
     dirs.append(get_skills_dir())
     dirs.extend(get_external_skills_dirs())
     return dirs
+
+
+def find_skill_name_collisions(roots: Optional[List[Path]] = None) -> List[Dict[str, Any]]:
+    """Find same-name skills with different content across active roots.
+
+    Resolution is first-wins, so silently carrying a stale local copy alongside a
+    canonical external skill is dangerous. Symlink aliases resolving to the same
+    directory and byte-identical mirrors are harmless and are ignored.
+    """
+    scan_roots = list(roots) if roots is not None else get_scan_ordered_skills_dirs()
+    by_name: Dict[str, List[Dict[str, str]]] = {}
+    seen_locations: Set[Tuple[str, str]] = set()
+    for root in scan_roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        for skill_file in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                resolved = str(skill_file.parent.resolve())
+                raw = skill_file.read_text(encoding="utf-8")
+                frontmatter, _ = parse_frontmatter(raw)
+                name = str(frontmatter.get("name") or skill_file.parent.name).strip()
+                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            except (OSError, UnicodeError):
+                continue
+            if not name or (name, resolved) in seen_locations:
+                continue
+            seen_locations.add((name, resolved))
+            by_name.setdefault(name, []).append({
+                "path": str(skill_file.parent),
+                "resolved_path": resolved,
+                "sha256": digest,
+            })
+
+    collisions = []
+    for name, entries in sorted(by_name.items()):
+        if len(entries) < 2 or len({entry["sha256"] for entry in entries}) < 2:
+            continue
+        collisions.append({
+            "name": name,
+            "selected_path": entries[0]["path"],
+            "entries": entries,
+        })
+    return collisions
 
 
 # ── Project skill quarantine (scan-time injection defense) ────────────────

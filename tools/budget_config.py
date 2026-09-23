@@ -151,11 +151,24 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     always survives.
     """
     mcp_result_size = _configured_mcp_result_size()
+    # Named-tool overrides are profile configuration, not tool/agent branches.
+    # Keep defaults unchanged and retain model-window protection for overrides.
+    try:
+        from hermes_cli.config import load_config_readonly
+        block = load_config_readonly().get("tool_budget", {})
+        block = block if isinstance(block, dict) else {}
+    except Exception:
+        block = {}
+    raw_overrides = block.get("tool_overrides", {})
+    overrides = {name: value for name, value in raw_overrides.items()
+                 if isinstance(name, str) and type(value) is int and value > 0} if isinstance(raw_overrides, dict) else {}
+    configured_turn = block.get("turn_budget_chars")
+    turn_cap = configured_turn if type(configured_turn) is int and configured_turn > 0 else DEFAULT_TURN_BUDGET_CHARS
 
     if not context_length or context_length <= 0:
-        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS:
+        if mcp_result_size == DEFAULT_MCP_RESULT_SIZE_CHARS and not overrides and turn_cap == DEFAULT_TURN_BUDGET_CHARS:
             return DEFAULT_BUDGET
-        return BudgetConfig(mcp_result_size=mcp_result_size)
+        return BudgetConfig(mcp_result_size=mcp_result_size, tool_overrides=overrides, turn_budget=turn_cap)
 
     window_chars = context_length * _CHARS_PER_TOKEN
     per_result = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
@@ -164,11 +177,14 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     # Clamp: never exceed the historical defaults (so large models are
     # unchanged), never drop below the floor (so tiny models stay usable).
     per_result = max(_MIN_RESULT_SIZE_CHARS, min(per_result, DEFAULT_RESULT_SIZE_CHARS))
-    per_turn = max(_MIN_TURN_BUDGET_CHARS, min(per_turn, DEFAULT_TURN_BUDGET_CHARS))
+    per_turn = max(_MIN_TURN_BUDGET_CHARS, min(per_turn, turn_cap))
+    overrides = {name: min(value, max(_MIN_RESULT_SIZE_CHARS,
+                 int(window_chars * _PER_RESULT_WINDOW_FRACTION))) for name, value in overrides.items()}
 
     return BudgetConfig(
         default_result_size=per_result,
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
         mcp_result_size=mcp_result_size,
+        tool_overrides=overrides,
     )
