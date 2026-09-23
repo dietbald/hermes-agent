@@ -887,6 +887,55 @@ def _current_file_text(filepath: str, task_id: str = "default") -> str:
         return ""
 
 
+def _path_state_digest(filepath: str, task_id: str = "default") -> str:
+    """Digest of a path's CURRENT bytes, for the authorization identity.
+
+    TJS-259 round 6. The user does not approve a request in the abstract; they
+    approve a *change* — the request applied to the state the card showed
+    them. A released grant has no expiry, so binding only the request lets the
+    source state move underneath a waiting card:
+
+    * whole-file write — the card renders a diff against the target's current
+      text. Edit the target while the card waits and the resumed call rebuilds
+      the identical request identity, redeems the grant, and overwrites a
+      state the user was never shown.
+    * ``*** Move File: src -> dst`` — the card names the move but never the
+      source's contents. Swap ``src`` while the card waits and the grant
+      carries the new bytes into the protected destination.
+
+    Both were reproduced end to end through the live harness before this
+    existed. Digesting every path the request touches (targets *and* V4A
+    sources — both endpoints are already collected into the gate's path list)
+    covers both, and any further multi-file preimage for free.
+
+    Distinct sentinels matter: ``absent`` and an empty file are different
+    states the user would decide about differently, and an *unreadable* path
+    must never quietly look like either — it collapses to ``unreadable``,
+    which differs from every digest and so forces a fresh card rather than
+    silently reusing a grant.
+
+    Bytes, not text: no decoding, no normalization, chunked so a large file
+    costs one streamed pass and never a full in-memory copy.
+    """
+    try:
+        resolved = Path(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError, RuntimeError):
+        resolved = Path(_expand_tilde(filepath))
+    try:
+        if not resolved.exists():
+            return "absent"
+    except OSError:
+        return "unreadable"
+    h = hashlib.sha256()
+    try:
+        with open(resolved, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except (OSError, ValueError):
+        return "unreadable"
+    return h.hexdigest()
+
+
 def _redact_diff_text(lines: list[str]) -> str:
     """Redact a unified diff for display on an approval card.
 
@@ -1081,6 +1130,13 @@ def _write_request_identity(
         The real destinations, resolved through the task's base dir, sorted
         and deduplicated, so the same relative path under a different task
         is a different request.
+    source state digests (TJS-259 round 6)
+        The current bytes of every path the request touches. A user approves
+        a *change*, not a request in the abstract, and a released grant has
+        no expiry: editing the target (or a V4A Move's source) while the card
+        waits otherwise reproduces the same request identity and redeems the
+        grant against a state that was never shown. Both were reproduced live
+        before this component existed.
     ``replace_all`` and occurrence scope
         How many occurrences the approval covers. The count is read from the
         file the user is deciding about; when it cannot be read the scope is
@@ -1127,10 +1183,17 @@ def _write_request_identity(
             scope = "?"
 
     return "\x1f".join([
-        "hermes.write-request.v1",
+        "hermes.write-request.v2",
         f"mode={mode}",
         f"task={task_id}",
         "targets=" + "\x1e".join(targets),
+        # TJS-259 round 6: the state each touched path is in RIGHT NOW. The
+        # user approved a change against this state; if it moves while the
+        # released card waits, the resumed call must not redeem the grant.
+        # Covers both reproduced defects — the whole-file preimage and the
+        # V4A Move source — because `paths` already carries every endpoint.
+        "states=" + "\x1e".join(
+            _path_state_digest(t, task_id) for t in targets),
         f"replace_all={bool(replace_all)}",
         f"occurrences={scope}",
         f"content={_d(content)}",
