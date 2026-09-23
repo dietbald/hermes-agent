@@ -891,10 +891,17 @@ class TestProtectedInstructionApprovalPreview:
         assert "opaquevalue1234567890abcd" not in text
         assert "abc123def456" not in text
 
-    def test_preview_failure_falls_back_to_placeholder(self, tmp_path,
-                                                       approvals,
-                                                       monkeypatch):
-        """A broken preview must not break the gate. TJS-228 finding 2."""
+    def test_preview_failure_fails_closed(self, tmp_path, approvals,
+                                          monkeypatch):
+        """A broken preview must BLOCK, not degrade the approval.
+
+        Was TJS-228 finding 2 ("must not break the gate"), which the fix
+        satisfied by falling back to a ``<write to X>`` placeholder. TJS-258
+        reverses that half: a placeholder card asks the user to approve a
+        change it cannot show them, and the resulting grant is weaker than
+        the decision the gate needs. Fail closed instead. The gate is still
+        never taken down by the exception — it returns a BLOCKED string.
+        """
         import json
         import tools.file_tools as ft
         from tools.file_tools import write_file_tool
@@ -903,13 +910,14 @@ class TestProtectedInstructionApprovalPreview:
             raise RuntimeError("preview exploded")
 
         monkeypatch.setattr(ft, "_build_write_preview_inner", boom)
-        approvals["answer"] = "deny"
+        approvals["answer"] = "once"
 
-        res = json.loads(write_file_tool(str(tmp_path / "AGENTS.md"), "x\n"))
-        # Still gated, still denied — just without the diff.
+        target = tmp_path / "AGENTS.md"
+        res = json.loads(write_file_tool(str(target), "x\n"))
         assert res.get("error") and "BLOCKED" in res["error"]
-        assert len(approvals["calls"]) == 1
-        assert approvals["calls"][0]["command"] == "<write to AGENTS.md>"
+        assert approvals["calls"] == [], (
+            "a card was raised for a change that could not be rendered")
+        assert not target.exists(), "the write landed despite the block"
 
     def test_summary_leads_so_it_survives_truncation(self, tmp_path,
                                                      approvals):

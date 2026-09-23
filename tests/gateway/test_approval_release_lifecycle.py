@@ -405,10 +405,18 @@ def test_fingerprint_does_not_retain_the_secret():
 
 
 def test_protected_write_grant_is_not_keyed_on_the_redacted_preview(
-        monkeypatch):
+        monkeypatch, tmp_path):
     """The motivating path. The card shows a REDACTED diff, so two writes
     whose secrets differ only inside the masked span render identically.
-    Approving one must not authorize the other."""
+    Approving one must not authorize the other.
+
+    TJS-258: identity is no longer carried on the preview — it is built by
+    ``_write_request_identity`` from the write REQUEST. This test therefore
+    drives the REAL builder rather than hand-constructing an identity, which
+    is what let the replace_all defect through in review round 5. The
+    end-to-end version of this check lives in
+    ``tests/gateway/test_live_approval_identity.py``.
+    """
     import tools.file_tools as FT
 
     def key(middle):
@@ -420,17 +428,25 @@ def test_protected_write_grant_is_not_keyed_on_the_redacted_preview(
         "precondition: these two writes must render to the same preview"
     )
 
+    target = tmp_path / "AGENTS.md"
+    target.write_text("")
+    content1 = "DEPLOY_KEY=" + key("MIDDLE1111") + "\n"
+    content2 = "DEPLOY_KEY=" + key("MIDDLE2222") + "\n"
+
     def preview(body):
         return FT._WritePreview(
             diff="AGENTS.md: +1/-0\n" + FT._redact_diff_text(body),
             summary="+1/-0 lines",
-            identity=A._operation_fingerprint(
-                "\n".join(body), ["protected_instruction_file"]),
         )
 
+    def identity(content):
+        return FT._write_request_identity(
+            [str(target)], "default", mode="write", content=content)
+
     p1, p2 = preview(body1), preview(body2)
+    id1, id2 = identity(content1), identity(content2)
     assert p1.diff == p2.diff
-    assert p1.identity != p2.identity, (
+    assert id1 and id2 and id1 != id2, (
         "identity collided across two different secrets"
     )
 
@@ -441,24 +457,25 @@ def test_protected_write_grant_is_not_keyed_on_the_redacted_preview(
     A.register_gateway_wake(sk, lambda data, result: None)
 
     first = FT._request_protected_instruction_approval(
-        ["AGENTS.md"], "default", p1)
+        ["AGENTS.md"], "default", p1, id1)
     assert "PENDING APPROVAL" in (first or "")
     assert len(cards) == 1
     A.resolve_gateway_approval(sk, "once")
 
     other = FT._request_protected_instruction_approval(
-        ["AGENTS.md"], "default", p2)
+        ["AGENTS.md"], "default", p2, id2)
     assert other is not None, (
         "a different secret was written on the grant for another write"
     )
     assert len(cards) == 2, "the different write did not raise its own card"
 
     same = FT._request_protected_instruction_approval(
-        ["AGENTS.md"], "default", p1)
+        ["AGENTS.md"], "default", p1, id1)
     assert same is None, "the approved write could not redeem its own grant"
     assert len(cards) == 2
 
-    # The card must stay redacted and must not carry the identity digest.
+    # The card must stay redacted and must not carry the raw secret or the
+    # identity string (which holds the digests the grant is keyed on).
     for card in cards:
         assert key("MIDDLE1111") not in str(card)
-        assert p1.identity not in str(card)
+        assert id1 not in str(card)

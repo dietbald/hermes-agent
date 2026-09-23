@@ -3921,6 +3921,8 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    raw_operation: Optional[str] = None,
+    require_raw_operation: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3959,6 +3961,16 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        raw_operation: Identity of the operation for a released "once"
+            grant (TJS-256/258). MUST be derived from the request inputs,
+            never from ``display_target`` — that string is redacted for the
+            card and collides across different operations. When ``None`` the
+            gate falls back to ``display_target`` (historical command-path
+            behaviour, where the display string IS the raw command).
+        require_raw_operation: When True, a missing ``raw_operation`` on the
+            gateway path BLOCKS instead of falling back. File-write callers
+            set this: their ``display_target`` is a redacted diff preview and
+            binding a grant to it is exactly the defect class TJS-258 fixes.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -4056,6 +4068,31 @@ def _run_approval_gate(
             notify_cb = _gateway_notify_cbs.get(session_key)
 
         if notify_cb is not None:
+            # TJS-258: a released "once" grant binds to this identity. When
+            # the caller declares the identity mandatory and could not build
+            # one, block instead of raising a card whose answer would bind to
+            # the redacted display string (which collides across different
+            # secrets and across replace_all=True/False).
+            if require_raw_operation and not raw_operation:
+                logger.error(
+                    "%s (pattern: %s): no operation identity available — "
+                    "blocking rather than binding an approval to the "
+                    "redacted display text", autoapprove_log_prefix,
+                    pattern_key,
+                )
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: approval required ({description}) but the "
+                        "exact operation could not be identified, so an "
+                        "approval could not be bound to it. Do NOT retry it "
+                        "via another path."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "no_identity",
+                    "user_consent": False,
+                }
             from agent.redact import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(display_target),
@@ -4067,9 +4104,12 @@ def _run_approval_gate(
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway",
-                # TJS-256: approval_data["command"] is redacted for display;
-                # identity must come from the raw text.
-                raw_operation=display_target,
+                # TJS-256/258: approval_data["command"] is redacted for
+                # display; identity must come from the caller's raw operation
+                # (a write-request identity for the file gates, the raw
+                # command text for the command gates).
+                raw_operation=(raw_operation if raw_operation is not None
+                               else display_target),
             )
             if decision.get("notify_failed"):
                 return {
