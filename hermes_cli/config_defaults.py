@@ -2468,6 +2468,13 @@ DEFAULT_CONFIG = {
     "approvals": {
         "mode": "smart",
         "timeout": 300,
+        # TJS-226: when True, raising an approval card RELEASES the agent
+        # thread instead of parking it on the answer. The run is resumed by a
+        # wake turn when the user taps. Requires a gateway that registers an
+        # approval wake callback (gateway/run.py); sessions without one keep
+        # blocking regardless of this setting. Default False so the fleet
+        # behaviour is unchanged until switched on deliberately.
+        "release_thread": False,
         "cron_mode": "deny",
         "single_query_mode": "deny",
         # Operator-customizable policy text for smart approvals. When

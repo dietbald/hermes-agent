@@ -57,6 +57,7 @@ def _make_background_cli_stub():
     cli._provider_sort = None
     cli._provider_require_params = None
     cli._provider_data_collection = None
+    cli._provider_zdr = False
     cli._openrouter_min_coding_score = None
     cli._fallback_model = None
     cli._agent_running = False
@@ -593,4 +594,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

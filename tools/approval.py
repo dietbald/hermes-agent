@@ -23,7 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import Any, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -2783,7 +2783,8 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged",
+                 "released")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2791,6 +2792,10 @@ class _ApprovalEntry:
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        # True when the agent thread returned instead of parking on
+        # ``event.wait()`` (TJS-226). The answer must then be delivered by the
+        # session's wake callback rather than by unblocking a waiter.
+        self.released = False
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
@@ -2799,6 +2804,53 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# session_key → callable(approval_data: dict, decision: dict) -> None
+# Registered alongside the notify callback by a gateway that can push a NEW
+# turn into the session after the current one ended (TJS-226). Its presence is
+# what makes releasing the agent thread safe: without a way to resume, an
+# early return would silently drop the user's answer on the floor.
+_gateway_wake_cbs: dict[str, Any] = {}
+
+
+def register_gateway_wake(session_key: str, cb) -> None:
+    """Register a per-session callback that resumes the run after an answer.
+
+    Signature ``cb(approval_data: dict, decision: dict) -> None``. Called from
+    :func:`resolve_gateway_approval` when the resolved entry was raised in
+    release mode (the agent thread already returned). The callback is
+    responsible for delivering a wake turn to the session — see
+    ``gateway.wake.deliver_wake``.
+    """
+    with _lock:
+        _gateway_wake_cbs[session_key] = cb
+
+
+def unregister_gateway_wake(session_key: str) -> None:
+    """Drop the wake callback for a session (end of turn / shutdown)."""
+    with _lock:
+        _gateway_wake_cbs.pop(session_key, None)
+
+
+def _thread_release_enabled() -> bool:
+    """True when approvals may release the agent thread instead of parking it.
+
+    ``approvals.release_thread`` in config.yaml. Defaults to False so the
+    fleet keeps today's blocking behaviour until this is switched on
+    deliberately (TJS-226). Even when True, releasing only happens where a
+    wake callback is registered for the session.
+    """
+    try:
+        return bool(_get_approval_config().get("release_thread", False))
+    except Exception:
+        return False
+
+
+def _can_release_thread(session_key: str) -> bool:
+    """True when this session can be released AND resumed."""
+    if not _thread_release_enabled():
+        return False
+    with _lock:
+        return _gateway_wake_cbs.get(session_key) is not None
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2865,6 +2917,34 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if reason:
             entry.reason = reason
         entry.event.set()
+        # Released entries have no waiter to unblock — the agent thread
+        # already returned (TJS-226). Resume the run by pushing a new turn
+        # carrying the decision. Failures are logged, never raised: the
+        # caller is a platform button handler and must still answer the user.
+        if entry.released:
+            with _lock:
+                wake_cb = _gateway_wake_cbs.get(session_key)
+            if wake_cb is None:
+                logger.error(
+                    "Approval %s for session %s was released but no wake "
+                    "callback is registered — the user's answer (%s) cannot "
+                    "resume the run",
+                    entry.data.get("request_id"), session_key, choice,
+                )
+                continue
+            try:
+                wake_cb(dict(entry.data), {
+                    "resolved": True,
+                    "choice": choice,
+                    "reason": entry.reason,
+                })
+            except Exception:
+                logger.error(
+                    "Approval wake callback failed for session %s "
+                    "(request %s, choice %s)",
+                    session_key, entry.data.get("request_id"), choice,
+                    exc_info=True,
+                )
     return len(targets)
 
 
@@ -2965,9 +3045,18 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        _gateway_wake_cbs.pop(session_key, None)
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
+        #
+        # TJS-226: a RELEASED entry has no blocked waiter to unwind — nothing
+        # is idling. Firing the wake callback here would push a fabricated
+        # "denied" turn into a session the user is deliberately resetting
+        # (/new, /stop), so drop it silently instead. The card itself is
+        # cancelled by dropping the queue above.
+        if getattr(entry, "released", False):
+            continue
         entry.result = "deny"
         entry.event.set()
     _release_permission_mode_dependents(session_key)
@@ -3842,6 +3931,10 @@ def _run_approval_gate(
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
+            if decision.get("released"):
+                return released_pending_result(
+                    decision, pattern_key=pattern_key, description=description,
+                )
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
@@ -4345,6 +4438,45 @@ def _transport_denied_result(
     }
 
 
+def released_pending_result(decision: dict, *, pattern_key: str = "",
+                            description: str = "") -> dict:
+    """Build the tool-facing result for an approval that released the thread.
+
+    TJS-226. The card is live and unanswered; the run will be resumed by a
+    wake turn when the user taps. This is NOT a denial and NOT a timeout —
+    callers must return this instead of their "timed out without response"
+    branch, or the agent is told the user refused something they never saw.
+
+    The message tells the model to end the turn rather than retry, because a
+    retry would raise a second identical card.
+    """
+    return {
+        "approved": False,
+        "status": "approval_released",
+        "approval_pending": True,
+        "released": True,
+        "request_id": decision.get("request_id"),
+        "pattern_key": pattern_key,
+        "description": description,
+        "user_consent": False,
+        "outcome": "pending",
+        "message": (
+            "PENDING APPROVAL: the user has been sent an approval card for "
+            f"this action ({description or 'see card'}) and has not answered "
+            "yet. The card does NOT expire and your run has been released "
+            "rather than left waiting — you will be resumed automatically "
+            "with the decision whenever the user answers, which may be hours "
+            "from now.\n\n"
+            "Do NOT retry this action, do NOT rephrase it, and do NOT attempt "
+            "the same outcome by another path — each attempt sends the user "
+            "another card. Silence is not consent.\n\n"
+            "You are free to carry on with any OTHER work that does not "
+            "depend on this decision. If nothing else is left to do, end your "
+            "turn and report that approval is pending."
+        ),
+    }
+
+
 def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
                             *, surface: str = "gateway"):
     """Wait on an already-pending identical approval instead of re-prompting.
@@ -4444,7 +4576,8 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            allow_release: bool = True) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -4491,6 +4624,23 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 leader = existing
                 break
     if leader is not None:
+        # TJS-226: never park a follower on a released leader — that would
+        # reintroduce the exact blocking wait this change removes. Report the
+        # leader's pending card as released; the wake fired when the leader
+        # resolves carries the answer for this session.
+        if allow_release and getattr(leader, "released", False):
+            logger.info(
+                "Coalesced onto released approval %s for session %s — "
+                "follower thread released too",
+                leader.data.get("request_id"), session_key,
+            )
+            return {
+                "resolved": False,
+                "choice": None,
+                "released": True,
+                "coalesced": True,
+                "request_id": leader.data.get("request_id"),
+            }
         adopted = _await_coalesced_leader(
             session_key, leader, approval_data, surface=surface
         )
@@ -4539,6 +4689,32 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             choice="notify_failed",
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
+
+    # ── TJS-226: release the agent thread instead of parking it ──
+    # When the session can be resumed by a wake turn, do NOT sit on
+    # entry.event.wait() for the human's think time. Mark the entry released
+    # and return a distinct "released" decision; resolve_gateway_approval()
+    # will fire the wake callback when the answer lands. The entry stays in
+    # the queue so /approve, the platform buttons and has_blocking_approval()
+    # all keep working unchanged.
+    #
+    # This is what decouples the wait from approvals.timeout: a released
+    # entry has no deadline at all, so raising approvals.timeout to a year
+    # (TJS-222) can no longer park a thread for a year.
+    if allow_release and _can_release_thread(session_key):
+        with _lock:
+            entry.released = True
+        logger.info(
+            "Approval %s raised in release mode for session %s — agent "
+            "thread released, run resumes on the answer event",
+            entry.data.get("request_id"), session_key,
+        )
+        return {
+            "resolved": False,
+            "choice": None,
+            "released": True,
+            "request_id": entry.data.get("request_id"),
+        }
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
@@ -5084,6 +5260,11 @@ def check_all_command_guards(command: str, env_type: str,
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
+            if decision.get("released"):
+                return released_pending_result(
+                    decision, pattern_key=primary_key,
+                    description=combined_desc,
+                )
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
@@ -5646,6 +5827,11 @@ def check_execute_code_guard(code: str, env_type: str,
             "user_consent": False,
         }
 
+    if decision.get("released"):
+        return released_pending_result(
+            decision, pattern_key=pattern_key, description=description,
+        )
+
     resolved = decision["resolved"]
     choice = decision["choice"]
     deny_reason = decision.get("reason")
@@ -5741,6 +5927,13 @@ def request_elicitation_consent(
         try:
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface=surface,
+                # MCP elicitation is a synchronous request/response in the MCP
+                # protocol: the only outcomes are accept/decline/cancel, with
+                # no "pending, resume later" state to return to the server.
+                # Releasing here would be reported to the server as a decline
+                # of a card the user never saw, so this path stays blocking
+                # (TJS-226). It remains bounded by approvals.timeout.
+                allow_release=False,
             )
         except Exception as exc:
             logger.error(

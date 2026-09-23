@@ -7172,6 +7172,85 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _handle_paperclip_card_callback(self, query, data: str) -> None:
+        """Resolve a Paperclip decision card from a Telegram button press.
+
+        ``data`` is ``pcd:<accept|reject>:<key>`` (an 8-char handle the relay resolves against its
+        own state, because Telegram caps callback_data at 64 bytes and two uuids do not fit); the
+        older ``pcd:<accept|reject>:<issueId>:<interactionId>`` form is still accepted. The decision
+        itself is
+        applied by ``~/paperclip-relay/decide_server.py`` on 127.0.0.1, which holds the Paperclip
+        board key; this adapter never sees it. Failures surface in the button toast.
+        """
+        import json as _pcd_json
+        import os as _pcd_os
+        import urllib.request as _pcd_urlreq
+
+        parts = data.split(":")
+        if len(parts) == 5 and parts[1] == "ans":
+            _, action, ref, qi, oi = parts
+            payload_ref = {"key": ref, "qi": qi, "oi": oi}
+        elif len(parts) == 3:
+            _, action, ref = parts
+            payload_ref = {"key": ref}
+        elif len(parts) == 4:
+            _, action, issue_id, interaction_id = parts
+            payload_ref = {"issue": issue_id, "interaction": interaction_id}
+        else:
+            await query.answer(text="Malformed decision button.")
+            return
+        if action not in ("accept", "reject", "ans"):
+            await query.answer(text="Unknown decision action.")
+            return
+
+        port = _pcd_os.environ.get("PAPERCLIP_DECIDE_PORT", "8791")
+        token_path = _pcd_os.path.expanduser(
+            _pcd_os.environ.get("PAPERCLIP_DECIDE_TOKEN_FILE", "~/paperclip-relay/token.txt")
+        )
+        try:
+            token = open(token_path).read().strip()
+        except Exception:
+            await query.answer(text="Decision service is not configured on this box.")
+            return
+
+        def _post():
+            body = _pcd_json.dumps({
+                "token": token,
+                "action": action,
+                "who": getattr(query.from_user, "first_name", None) or "TJ",
+                **payload_ref,
+            }).encode()
+            req = _pcd_urlreq.Request(
+                "http://127.0.0.1:%s/decide" % port,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with _pcd_urlreq.urlopen(req, timeout=20) as r:
+                return _pcd_json.loads(r.read().decode() or "{}")
+
+        try:
+            res = await asyncio.get_running_loop().run_in_executor(None, _post)
+        except Exception as exc:
+            logger.error("[%s] paperclip decision failed: %s", self.name, exc)
+            await query.answer(text="Could not reach the decision service.")
+            return
+
+        ok = bool(res.get("ok"))
+        await query.answer(text=(res.get("text") or ("Done" if ok else "Failed"))[:190])
+        if ok and query.message and not res.get("partial"):
+            try:
+                await query.edit_message_text(
+                    text="%s\n\n<b>\u2192 %s</b>" % (
+                        query.message.text or "",
+                        _html.escape(str(res.get("text") or action)),
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7186,6 +7265,26 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Paperclip decision-card callbacks (pcd:action:issueId:interactionId) ---
+        # Sent by ~/paperclip-relay/relay.py through this agent's own bot. The Paperclip board key
+        # stays in the relay; we only forward the press to it over localhost, so no agent gateway
+        # ever holds board credentials.
+        if data.startswith("pcd:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(
+                    text="⛔ You are not authorized to resolve Paperclip cards."
+                )
+                return
+            await self._handle_paperclip_card_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

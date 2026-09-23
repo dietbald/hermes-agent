@@ -10,6 +10,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
@@ -840,8 +841,184 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+# Budget for the diff shown on an approval card. Adapters apply their OWN
+# caps on top of this and they vary a lot (base ``_EA_CMD_BUDGET`` is 3000,
+# WhatsApp truncates the command at 800 and the whole body at 1024), so a
+# trailing "[truncated]" marker cannot be relied on to survive. Hence two
+# defenses: keep this well under the smallest plausible cap, AND lead with
+# the summary line (see ``_build_write_preview``) so the file name and
+# change size are the first thing any truncation keeps.
+_WRITE_PREVIEW_BUDGET = 1500
+
+
+class _WritePreview(NamedTuple):
+    """What an approval card should show about a pending content write.
+
+    ``diff`` is the (already truncated + redacted) text rendered in the
+    card's fenced block; ``summary`` is the one-line ``+N/-M lines`` shape
+    folded into the card's reason text.
+    """
+    diff: str
+    summary: str
+
+
+def _current_file_text(filepath: str, task_id: str = "default") -> str:
+    """Best-effort read of a file's current text; ``""`` when unreadable.
+
+    Used only to build an approval preview, so every failure (missing file,
+    permissions, binary bytes) degrades to "treat as empty / new file"
+    rather than blocking the gate.
+    """
+    try:
+        resolved = Path(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError, RuntimeError):
+        resolved = Path(_expand_tilde(filepath))
+    try:
+        return resolved.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
+def _redact_diff_text(lines: list[str]) -> str:
+    """Redact a unified diff for display on an approval card.
+
+    TWO passes are required, because the redactor's rules disagree about
+    what a "text" is and neither pass alone is sufficient:
+
+    1. **Per line, marker stripped.** Its config-file rules (``api_key:
+       …``, ``password: …``) are line-anchored, so a leading ``+``/``-``
+       pushes the key off the start of the line and the value survives.
+       Its YAML pass is also gated on ``"://" not in text`` across the
+       WHOLE blob, so one URL anywhere would disable config redaction for
+       every other line. Redacting each line alone fixes both.
+    2. **The assembled blob.** Multiline rules — notably the PEM private
+       key block, which needs its ``BEGIN``/``END`` markers in one string
+       — cannot see across a per-line call, so pass 1 leaves a whole
+       private key in the clear. The blob pass still matches through the
+       ``+`` prefixes, so it recovers those. (Regression: TJS-230.)
+
+    Both run BEFORE truncation: truncating first could cut a PEM's ``END``
+    marker and defeat pass 2.
+
+    ``force=True`` because an approval card is a screenshottable egress
+    boundary that must redact even when the user disabled logging
+    redaction; ``redact_url_credentials=True`` for the same reason. NOT
+    ``file_read``/``code_file`` — those SKIP the ENV/JSON rules, which is
+    precisely backwards here (verified: they re-expose ``api_key:`` values
+    this path must mask).
+    """
+    per_line = []
+    for line in lines:
+        marker, rest = ((line[0], line[1:]) if line[:1] in ("+", "-", " ")
+                        else ("", line))
+        per_line.append(marker + redact_sensitive_text(
+            rest, force=True, redact_url_credentials=True))
+    return redact_sensitive_text(
+        "\n".join(per_line), force=True, redact_url_credentials=True)
+
+
+def _summarize_diff_lines(diff_lines: list[str]) -> str:
+    """``+N/-M lines`` counted from unified-diff body lines."""
+    added = sum(1 for ln in diff_lines
+                if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff_lines
+                  if ln.startswith("-") and not ln.startswith("---"))
+    return f"+{added}/-{removed} lines"
+
+
+def _build_write_preview(
+        paths: list[str], task_id: str = "default", *,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        patch: str | None = None) -> "_WritePreview | None":
+    """Build the diff preview an approval card should display.
+
+    Handles the three shapes the write/patch tools take: a whole-file
+    ``content`` write (diffed against the file on disk), a V4A ``patch``
+    (already a diff — shown as-is), and a replace-mode
+    ``old_string``/``new_string`` edit (diffed as a snippet, since the
+    surrounding file is unchanged). Returns ``None`` when there is nothing
+    useful to show; callers then fall back to the target-name placeholder.
+
+    NEVER raises: this runs before a security gate, and a preview that
+    blew up must degrade to the old placeholder rather than take the
+    approval path down with it.
+    """
+    try:
+        return _build_write_preview_inner(
+            paths, task_id, content=content, old_string=old_string,
+            new_string=new_string, replace_all=replace_all, patch=patch)
+    except Exception:
+        logger.warning(
+            "Approval-card diff preview failed; falling back to the "
+            "target-name placeholder", exc_info=True)
+        return None
+
+
+def _build_write_preview_inner(
+        paths: list[str], task_id: str = "default", *,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        patch: str | None = None) -> "_WritePreview | None":
+    """Preview construction proper. See ``_build_write_preview``."""
+    import difflib
+
+    scope = ""
+    if patch:
+        body = patch.splitlines()
+        label = "V4A patch"
+    elif content is not None and len(paths) == 1:
+        target = paths[0]
+        body = list(difflib.unified_diff(
+            _current_file_text(target, task_id).splitlines(),
+            content.splitlines(),
+            fromfile=f"a/{target}", tofile=f"b/{target}", lineterm=""))
+        label = os.path.basename(target) or target
+    elif old_string is not None and new_string is not None:
+        target = paths[0] if paths else "<file>"
+        body = list(difflib.unified_diff(
+            old_string.splitlines(), new_string.splitlines(),
+            fromfile=f"a/{target}", tofile=f"b/{target}", lineterm=""))
+        label = os.path.basename(target) or target
+        # Snippet-level: the rest of the file is untouched. Under
+        # ``replace_all`` this ONE snippet stands in for every occurrence,
+        # so say how many or the card understates the change.
+        if replace_all:
+            hits = _current_file_text(target, task_id).count(old_string) \
+                if old_string else 0
+            scope = (f", applied to all {hits} occurrences"
+                     if hits != 1 else ", applied to 1 occurrence")
+        else:
+            scope = ", one occurrence (rest of file unchanged)"
+    else:
+        return None
+
+    if not body:
+        return None
+
+    counts = _summarize_diff_lines(body)
+    text = _redact_diff_text(body)
+    truncated = len(text) > _WRITE_PREVIEW_BUDGET
+    if truncated:
+        text = text[:_WRITE_PREVIEW_BUDGET] + "\n... [truncated]"
+    # A diff can legitimately contain ``` (editing a markdown file), which
+    # would close the card's fence early and dump the rest as chat text.
+    text = text.replace("```", "`​`​`")
+
+    summary = f"{counts}{scope}" + (" (preview truncated)" if truncated else "")
+    # Lead with the summary: adapters truncate the fenced block at wildly
+    # different budgets (WhatsApp at 800), so the file name and change size
+    # must come FIRST to be guaranteed to survive.
+    return _WritePreview(diff=f"{label}: {summary}\n{text}", summary=summary)
+
+
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        reasons: list[str], task_id: str = "default",
+        preview: "_WritePreview | None" = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -856,7 +1033,12 @@ def _request_protected_instruction_approval(
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )
-    display = f"<write to {targets}>"
+    if preview is not None:
+        description += f" Change: {preview.summary}."
+    # The card renders this in its fenced code block (``_format_exec_approval``
+    # in gateway/platforms/base.py), so putting the diff here surfaces the
+    # actual change on every platform without any adapter-side change.
+    display = preview.diff if preview is not None else f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
@@ -897,6 +1079,24 @@ def _request_protected_instruction_approval(
             return blocked.format(
                 why="requires approval but the approval request could not "
                     "be delivered.")
+        if decision.get("released"):
+            # TJS-226: card is live and unanswered; the agent thread was
+            # released instead of parked. Not a denial — say so precisely,
+            # or the model reports a refusal the user never made.
+            return (
+                f"PENDING APPROVAL: the write to protected agent-instruction "
+                f"file(s) ({targets}) needs the user's approval. The card has "
+                "been sent, does NOT expire, and is still unanswered. Your "
+                "run was released rather than left waiting, and will be "
+                "resumed automatically with the decision whenever the user "
+                "answers — possibly hours from now.\n\n"
+                "Do NOT retry this write and do NOT attempt it via another "
+                "path (terminal, execute_code, patch) — each attempt sends "
+                "another card.\n\n"
+                "You are free to carry on with any OTHER work that does not "
+                "depend on this write. If nothing else is left, end your turn "
+                "and report that approval is pending."
+            )
         choice = decision.get("choice")
         if decision.get("resolved") and choice in {"once", "session", "always"}:
             # One-operation grant regardless of the tapped scope — nothing
@@ -939,8 +1139,9 @@ def _request_protected_instruction_approval(
             "present to approve it.")
 
 
-def _check_protected_instruction_write(paths: list[str],
-                                       task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(
+        paths: list[str], task_id: str = "default",
+        preview: "_WritePreview | None" = None) -> str | None:
     """Gate a write/patch touching protected instruction files.
 
     Returns ``None`` when no target is protected or the human approved;
@@ -961,11 +1162,12 @@ def _check_protected_instruction_write(paths: list[str],
             reasons.append(reason)
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(reasons, task_id, preview)
 
 
-def _check_approval_required_write(paths: list[str],
-                                   task_id: str = "default") -> str | None:
+def _check_approval_required_write(
+        paths: list[str], task_id: str = "default",
+        preview: "_WritePreview | None" = None) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config``).
 
     These paths are NOT credentials and NOT hard-denied, but a write must
@@ -995,6 +1197,8 @@ def _check_approval_required_write(paths: list[str],
         "The SSH config can carry ProxyCommand / Match exec directives that "
         "run commands, so writes require your approval."
     )
+    if preview is not None:
+        description += f" Change: {preview.summary}."
     blocked = (
         f"BLOCKED: write to SSH config file(s) ({display_targets}) "
         "{why} Do NOT retry it via another path (terminal, execute_code) "
@@ -1010,7 +1214,8 @@ def _check_approval_required_write(paths: list[str],
     result = _approval._run_approval_gate(
         pattern_key="ssh_config_write",
         description=description,
-        display_target=f"<write to {display_targets}>",
+        display_target=(preview.diff if preview is not None
+                        else f"<write to {display_targets}>"),
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
         single_query_deny_message=blocked.format(
@@ -2248,10 +2453,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
-    protected_err = _check_protected_instruction_write([path], task_id)
+    # Built once and shared by both gates so the approval card shows the
+    # actual change rather than only the target's name.
+    _preview = _build_write_preview([path], task_id, content=content)
+    protected_err = _check_protected_instruction_write([path], task_id, _preview)
     if protected_err:
         return tool_error(protected_err)
-    approval_err = _check_approval_required_write([path], task_id)
+    approval_err = _check_approval_required_write([path], task_id, _preview)
     if approval_err:
         return tool_error(approval_err)
     if not cross_profile:
@@ -2399,10 +2607,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return tool_error(binary_doc_err)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
-    protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
+    _preview = _build_write_preview(
+        _paths_to_check, task_id,
+        old_string=old_string, new_string=new_string,
+        replace_all=replace_all,
+        patch=patch if mode == "patch" else None)
+    protected_err = _check_protected_instruction_write(
+        _paths_to_check, task_id, _preview)
     if protected_err:
         return tool_error(protected_err)
-    approval_err = _check_approval_required_write(_paths_to_check, task_id)
+    approval_err = _check_approval_required_write(
+        _paths_to_check, task_id, _preview)
     if approval_err:
         return tool_error(approval_err)
     try:
