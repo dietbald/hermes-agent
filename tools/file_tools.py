@@ -857,9 +857,19 @@ class _WritePreview(NamedTuple):
     ``diff`` is the (already truncated + redacted) text rendered in the
     card's fenced block; ``summary`` is the one-line ``+N/-M lines`` shape
     folded into the card's reason text.
+
+    ``identity`` (TJS-256) is a salted digest of the RAW, UNREDACTED diff.
+    It exists because ``diff`` is redacted and therefore cannot identify the
+    operation: two writes whose secrets differ only inside the masked span
+    render to the same preview (verified: two deploy keys sharing a prefix
+    and suffix both render ``+DEPLOY_KEY=***``). Approving one write must
+    not authorize the other, so the released-"once" grant is keyed on this
+    instead. It is a digest, never the raw text, and it is never placed in
+    the card payload.
     """
     diff: str
     summary: str
+    identity: str = ""
 
 
 def _current_file_text(filepath: str, task_id: str = "default") -> str:
@@ -1013,7 +1023,14 @@ def _build_write_preview_inner(
     # Lead with the summary: adapters truncate the fenced block at wildly
     # different budgets (WhatsApp at 800), so the file name and change size
     # must come FIRST to be guaranteed to survive.
-    return _WritePreview(diff=f"{label}: {summary}\n{text}", summary=summary)
+    # Identity from the RAW body, before redaction and truncation — both of
+    # those are lossy and collide across different secrets.
+    from tools.approval import _operation_fingerprint
+    return _WritePreview(
+        diff=f"{label}: {summary}\n{text}", summary=summary,
+        identity=_operation_fingerprint(
+            "\n".join(body), ["protected_instruction_file"]),
+    )
 
 
 def _request_protected_instruction_approval(
@@ -1064,10 +1081,9 @@ def _request_protected_instruction_approval(
         notify_cb = None
 
     if notify_cb is not None:
-        # NOTE (TJS-256): the released "once" grant for this exact write is
-        # redeemed centrally inside _await_gateway_decision(), keyed on the
-        # same `display` string passed as "command" below. Do not redeem it
-        # here as well — that would consume the grant twice.
+        # NOTE (TJS-256): the released "once" grant for this write is
+        # redeemed centrally inside _await_gateway_decision(). Do not redeem
+        # it here as well — that would consume the grant twice.
         approval_data = {
             "command": display,
             "pattern_key": "protected_instruction_file",
@@ -1078,6 +1094,13 @@ def _request_protected_instruction_approval(
         }
         decision = _approval._await_gateway_decision(
             session_key, notify_cb, approval_data, surface="gateway",
+            # TJS-256: `display` is the REDACTED diff preview, so it is not
+            # operation identity — two different secrets can render to the
+            # same preview. Pass the raw-derived identity instead. Falls back
+            # to the target list when there is no preview (that string holds
+            # no secret).
+            raw_operation=(preview.identity if preview is not None
+                           and preview.identity else display),
         )
         if decision.get("notify_failed"):
             return blocked.format(

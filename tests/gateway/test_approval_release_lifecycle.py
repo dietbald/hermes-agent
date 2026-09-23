@@ -399,3 +399,66 @@ def test_fingerprint_does_not_retain_the_secret():
     fp = A._operation_fingerprint(f"deploy {secret}", ["deploy"])
     assert secret not in fp
     assert "Q" * 30 not in fp
+
+
+# ── Round-4 review (TJS-256): the protected-write consumer ──────────────
+
+
+def test_protected_write_grant_is_not_keyed_on_the_redacted_preview(
+        monkeypatch):
+    """The motivating path. The card shows a REDACTED diff, so two writes
+    whose secrets differ only inside the masked span render identically.
+    Approving one must not authorize the other."""
+    import tools.file_tools as FT
+
+    def key(middle):
+        return "sk-ant-api03-" + "A" * 10 + middle + "Z" * 10
+
+    body1 = ["AGENTS.md: deploy key", "+DEPLOY_KEY=" + key("MIDDLE1111")]
+    body2 = ["AGENTS.md: deploy key", "+DEPLOY_KEY=" + key("MIDDLE2222")]
+    assert FT._redact_diff_text(body1) == FT._redact_diff_text(body2), (
+        "precondition: these two writes must render to the same preview"
+    )
+
+    def preview(body):
+        return FT._WritePreview(
+            diff="AGENTS.md: +1/-0\n" + FT._redact_diff_text(body),
+            summary="+1/-0 lines",
+            identity=A._operation_fingerprint(
+                "\n".join(body), ["protected_instruction_file"]),
+        )
+
+    p1, p2 = preview(body1), preview(body2)
+    assert p1.diff == p2.diff
+    assert p1.identity != p2.identity, (
+        "identity collided across two different secrets"
+    )
+
+    sk = A.get_current_session_key()
+    monkeypatch.setattr(A, "_thread_release_enabled", lambda: True)
+    cards = []
+    A.register_gateway_notify(sk, lambda data: cards.append(data))
+    A.register_gateway_wake(sk, lambda data, result: None)
+
+    first = FT._request_protected_instruction_approval(
+        ["AGENTS.md"], "default", p1)
+    assert "PENDING APPROVAL" in (first or "")
+    assert len(cards) == 1
+    A.resolve_gateway_approval(sk, "once")
+
+    other = FT._request_protected_instruction_approval(
+        ["AGENTS.md"], "default", p2)
+    assert other is not None, (
+        "a different secret was written on the grant for another write"
+    )
+    assert len(cards) == 2, "the different write did not raise its own card"
+
+    same = FT._request_protected_instruction_approval(
+        ["AGENTS.md"], "default", p1)
+    assert same is None, "the approved write could not redeem its own grant"
+    assert len(cards) == 2
+
+    # The card must stay redacted and must not carry the identity digest.
+    for card in cards:
+        assert key("MIDDLE1111") not in str(card)
+        assert p1.identity not in str(card)
