@@ -2538,6 +2538,9 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
+# TJS-226: single-use grants from released cards answered "once". Keyed by
+# session, consumed by is_approved() on first match.
+_released_once_grants: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
@@ -2874,8 +2877,18 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        # TJS-226: a RELEASED entry has no waiter to unblock and must outlive
+        # the turn that raised it — that is the whole point of releasing the
+        # thread. Turn teardown runs in the agent's finally block, long before
+        # the human taps, so dropping released entries here would destroy the
+        # card and make the later tap resolve nothing (no wake, run parked
+        # forever). Keep them queued; only blocked waiters are signalled.
+        survivors = [e for e in entries if getattr(e, "released", False)]
+        if survivors:
+            _gateway_queues[session_key] = survivors
     for entry in entries:
-        entry.event.set()
+        if not getattr(entry, "released", False):
+            entry.event.set()
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2922,6 +2935,33 @@ def resolve_gateway_approval(session_key: str, choice: str,
         # carrying the decision. Failures are logged, never raised: the
         # caller is a platform button handler and must still answer the user.
         if entry.released:
+            # TJS-226: the caller that raised this card already returned, so
+            # the normal caller-side persistence of a session/always grant
+            # never runs. Apply it here, or the wake turn retries the action
+            # and is prompted all over again — the exact re-ask loop TJS-222
+            # is about. "once" is deliberately NOT persisted: the wake turn
+            # re-runs the operation and consumes the one-shot grant below.
+            _keys = entry.data.get("pattern_keys") or []
+            if not _keys and entry.data.get("pattern_key"):
+                _keys = [entry.data["pattern_key"]]
+            if choice == "session":
+                for _k in _keys:
+                    approve_session(session_key, _k)
+            elif choice == "once":
+                for _k in _keys:
+                    grant_released_once(session_key, _k)
+            elif choice == "always":
+                for _k in _keys:
+                    approve_session(session_key, _k)
+                    approve_permanent(_k)
+                try:
+                    save_permanent_allowlist(_permanent_approved)
+                except Exception:
+                    logger.error(
+                        "Failed to persist permanent allowlist after a "
+                        "released approval was answered 'always' "
+                        "(session %s)", session_key, exc_info=True,
+                    )
             with _lock:
                 wake_cb = _gateway_wake_cbs.get(session_key)
             if wake_cb is None:
@@ -3042,6 +3082,7 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        _released_once_grants.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
@@ -3086,7 +3127,30 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
         if any(alias in _permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
-        return any(alias in session_approvals for alias in aliases)
+        if any(alias in session_approvals for alias in aliases):
+            return True
+        # TJS-226: a released card answered "once" grants exactly one
+        # operation. The thread that raised it already returned, so the wake
+        # turn has to retry the action — without this one-shot grant the
+        # retry raises a second card and the user is asked again for
+        # something they just approved. Consumed on first use.
+        once = _released_once_grants.get(session_key)
+        if once:
+            for alias in aliases:
+                if alias in once:
+                    once.discard(alias)
+                    if not once:
+                        _released_once_grants.pop(session_key, None)
+                    return True
+        return False
+
+
+def grant_released_once(session_key: str, pattern_key: str) -> None:
+    """Record a single-use grant for a released approval answered "once"."""
+    if not pattern_key:
+        return
+    with _lock:
+        _released_once_grants.setdefault(session_key, set()).add(pattern_key)
 
 
 def approve_permanent(pattern_key: str):
@@ -4649,7 +4713,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         # Leader resolved "once" — fall through to a fresh prompt below.
 
     entry = _ApprovalEntry(approval_data)
+    # TJS-226: decide release BEFORE the entry is reachable by a resolver.
+    # notify_cb below hands the card to the platform, and the user can tap
+    # before notify_cb even returns. If entry.released were still False at
+    # that moment, resolve_gateway_approval() would treat it as a blocking
+    # waiter, drop it, and fire no wake — while this function still returns
+    # "released". That loses the answer permanently. Setting the flag under
+    # the same lock that publishes the entry makes release/resolve atomic.
+    _will_release = bool(allow_release and _can_release_thread(session_key))
     with _lock:
+        entry.released = _will_release
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
@@ -4701,9 +4774,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # This is what decouples the wait from approvals.timeout: a released
     # entry has no deadline at all, so raising approvals.timeout to a year
     # (TJS-222) can no longer park a thread for a year.
-    if allow_release and _can_release_thread(session_key):
-        with _lock:
-            entry.released = True
+    if _will_release:
+        # entry.released was already set atomically with publication above.
         logger.info(
             "Approval %s raised in release mode for session %s — agent "
             "thread released, run resumes on the answer event",
