@@ -887,53 +887,170 @@ def _current_file_text(filepath: str, task_id: str = "default") -> str:
         return ""
 
 
+#: Sentinel for a path whose current state could not be read. It is NOT a
+#: usable identity component: two unreadable states are not "the same state",
+#: so a gate that sees it must BLOCK rather than compare (TJS-259 round 7,
+#: defect 2 — a stable ``unreadable`` literal matched itself and let a grant
+#: be redeemed against changed bytes of a write-only file).
+_STATE_UNREADABLE = "unreadable"
+_STATE_ABSENT = "absent"
+
+
 def _path_state_digest(filepath: str, task_id: str = "default") -> str:
     """Digest of a path's CURRENT bytes, for the authorization identity.
 
     TJS-259 round 6. The user does not approve a request in the abstract; they
     approve a *change* — the request applied to the state the card showed
     them. A released grant has no expiry, so binding only the request lets the
-    source state move underneath a waiting card:
+    source state move underneath a waiting card: edit the target (or a
+    ``*** Move File:`` source) while the card waits and the resumed call
+    rebuilds an identical request identity, redeems the grant, and writes
+    something the user was never shown. Both were reproduced live.
 
-    * whole-file write — the card renders a diff against the target's current
-      text. Edit the target while the card waits and the resumed call rebuilds
-      the identical request identity, redeems the grant, and overwrites a
-      state the user was never shown.
-    * ``*** Move File: src -> dst`` — the card names the move but never the
-      source's contents. Swap ``src`` while the card waits and the grant
-      carries the new bytes into the protected destination.
+    Read through the BACKEND, not the host (round 7, defect 1). Previously
+    this called host ``Path.exists()``/``open()`` while the write itself goes
+    through ``ShellFileOperations`` in whatever terminal environment the task
+    owns. Under a container backend those are two different filesystems: two
+    distinct remote states both mapped to the same absent host path, so the
+    digests collided and the grant was reused. Going through
+    ``_get_file_ops(task_id)`` — the exact object that performs the write —
+    makes "the state I hashed" and "the state I am about to overwrite" the
+    same file by construction, instead of by a backend-type branch that can
+    be got wrong later.
 
-    Both were reproduced end to end through the live harness before this
-    existed. Digesting every path the request touches (targets *and* V4A
-    sources — both endpoints are already collected into the gate's path list)
-    covers both, and any further multi-file preimage for free.
+    Three outcomes, deliberately distinct:
 
-    Distinct sentinels matter: ``absent`` and an empty file are different
-    states the user would decide about differently, and an *unreadable* path
-    must never quietly look like either — it collapses to ``unreadable``,
-    which differs from every digest and so forces a fresh card rather than
-    silently reusing a grant.
-
-    Bytes, not text: no decoding, no normalization, chunked so a large file
-    costs one streamed pass and never a full in-memory copy.
+    ``absent``
+        No such path. Different from an empty file, which is a state the user
+        would decide about differently.
+    :data:`_STATE_UNREADABLE`
+        The state could not be determined. Callers must treat this as "cannot
+        authorize", never as an identity to compare — see the constant.
+    a digest
+        SHA-256 over the backend's byte-exact content.
     """
     try:
-        resolved = Path(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError, RuntimeError):
-        resolved = Path(_expand_tilde(filepath))
+        ops = _get_file_ops(task_id)
+    except Exception:
+        return _STATE_UNREADABLE
     try:
-        if not resolved.exists():
-            return "absent"
-    except OSError:
-        return "unreadable"
-    h = hashlib.sha256()
+        result = ops.read_file_bytes(filepath)
+    except Exception:
+        return _STATE_UNREADABLE
+    err = getattr(result, "error", None)
+    if err:
+        # A read failure is AMBIGUOUS: missing and unreadable both fail, and
+        # ShellFileOperations reports both as "File not found". Parsing the
+        # message would reintroduce defect 2 (an unreadable file classified
+        # as `absent`, a stable value that matches itself). Ask the backend
+        # directly instead; "cannot tell" resolves to unreadable, so every
+        # ambiguous case fails closed.
+        try:
+            exists = ops.path_exists(filepath)
+        except Exception:
+            exists = None
+        return _STATE_ABSENT if exists is False else _STATE_UNREADABLE
+    payload = getattr(result, "base64_content", None)
+    if payload is None:
+        return _STATE_UNREADABLE
+    return hashlib.sha256(payload.encode("ascii", "ignore")).hexdigest()
+
+
+def _resolve_write_targets(paths: list[str], task_id: str = "default") -> list[str]:
+    """Sorted, deduplicated resolved targets of a write request."""
+    resolved: list[str] = []
+    for p in paths or []:
+        try:
+            resolved.append(str(_resolve_path_for_task(p, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            # An unresolvable path is still a distinct target; use the
+            # normalized input rather than dropping it (dropping would make
+            # two different requests look identical).
+            resolved.append(os.path.normpath(_expand_tilde(p)))
+    return sorted(dict.fromkeys(resolved))
+
+
+def _capture_path_states(targets: list[str],
+                         task_id: str = "default") -> list[str]:
+    """State of each target, positionally aligned with *targets*."""
+    return [_path_state_digest(t, task_id) for t in targets]
+
+
+def _unverifiable_state_error(targets: list[str], states: list[str]) -> str | None:
+    """BLOCKED message when any target's state cannot be established.
+
+    Fail closed, and fail *loudly*: raising a card the user cannot meaningfully
+    answer (the card would describe a change against a state nobody can read)
+    would loop forever, because the state stays unreadable on every resume. A
+    plain block names the path and ends the attempt.
+    """
+    bad = [t for t, s in zip(targets, states) if s == _STATE_UNREADABLE]
+    if not bad:
+        return None
+    return (
+        "BLOCKED: cannot verify the current contents of "
+        f"{', '.join(bad)}, so this write cannot be authorized — an approval "
+        "must be bound to the state it was reviewed against. Fix the path's "
+        "readability (permissions, file type, backend availability) and retry."
+    )
+
+
+def _state_drift_error(targets: list[str], approved_states: list[str],
+                       task_id: str = "default") -> str | None:
+    """BLOCKED message when a target changed after the gate decided.
+
+    TJS-259 round 7, defect 3. The gate runs before ``file_state.lock_path``,
+    so between "this identity redeemed the grant" and "the bytes are written"
+    another writer — a concurrent subagent, which is a supported and
+    deliberately serialized case — can change the file. The lock exists for
+    exactly those writers, so the check has to happen *inside* it. Re-reading
+    here and refusing on any difference closes the window: whatever the gate
+    authorized is what gets overwritten, or nothing is.
+    """
+    current = _capture_path_states(targets, task_id)
+    changed = [t for t, before, after in zip(targets, approved_states, current)
+               if before != after or after == _STATE_UNREADABLE]
+    if not changed:
+        return None
+    return (
+        f"BLOCKED: {', '.join(changed)} changed after this write was "
+        "approved, so the approval no longer covers it. Nothing was written. "
+        "Re-read the file and retry — that will raise a fresh approval for "
+        "the current contents."
+    )
+
+
+def _write_gate_applies(paths: list[str], task_id: str = "default") -> bool:
+    """Whether any approval gate will look at this request.
+
+    TJS-259 round 7, defect 4: identity (and therefore state hashing) used to
+    be built unconditionally, so every ordinary write hashed every touched
+    path — a measured 1.178 s on a 1 GiB file, and it turned a V4A
+    Delete/Move of a large unprotected file from metadata-bound into a full
+    read. Nothing outside the gates consumes the identity, so it is only
+    computed when a gate exists to consume it.
+
+    Deliberately uses the same predicates the gates themselves use, so the
+    two cannot drift apart on what "gated" means. If it ever does drift, it
+    drifts SAFE: a false negative here hands the gate ``identity=None``, and
+    both gates already fail closed on that.
+    """
     try:
-        with open(resolved, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-    except (OSError, ValueError):
-        return "unreadable"
-    return h.hexdigest()
+        enabled, extra = _protected_instruction_config()
+        if enabled and any(
+                _protected_instruction_reason(
+                    p, task_id, enabled=enabled, extra_patterns=extra)
+                for p in paths):
+            return True
+    except Exception:
+        return True  # cannot tell → assume gated (fail safe)
+    try:
+        from agent.file_safety import is_write_approval_required
+        if any(is_write_approval_required(p) for p in paths):
+            return True
+    except Exception:
+        return True
+    return False
 
 
 def _redact_diff_text(lines: list[str]) -> str:
@@ -1103,6 +1220,7 @@ def _write_request_identity(
         old_string: str | None = None,
         new_string: str | None = None,
         replace_all: bool = False,
+        states: list[str] | None = None,
         patch: str | None = None) -> str | None:
     """Canonical identity of the write REQUEST the user is being asked about.
 
@@ -1161,18 +1279,17 @@ def _write_request_identity(
     if mode not in ("write", "replace", "patch"):
         return None
 
-    resolved: list[str] = []
-    for p in paths or []:
-        try:
-            resolved.append(str(_resolve_path_for_task(p, task_id)))
-        except (OSError, ValueError, RuntimeError):
-            # An unresolvable path is still a distinct target; use the
-            # normalized input rather than dropping it (dropping would make
-            # two different requests look identical).
-            resolved.append(os.path.normpath(_expand_tilde(p)))
-    if not resolved:
+    targets = _resolve_write_targets(paths, task_id)
+    if not targets:
         return None
-    targets = sorted(dict.fromkeys(resolved))
+    if states is None:
+        states = _capture_path_states(targets, task_id)
+    if any(s == _STATE_UNREADABLE for s in states):
+        # Never build an identity out of an unreadable state: the sentinel is
+        # a stable literal and would MATCH ITSELF, so two different unreadable
+        # states would share a grant (TJS-259 round 7, defect 2). Callers fail
+        # closed on None; `_unverifiable_state_error` gives the user a reason.
+        return None
 
     # Occurrence scope only means something for a replace.
     scope = "-"
@@ -1192,8 +1309,7 @@ def _write_request_identity(
         # released card waits, the resumed call must not redeem the grant.
         # Covers both reproduced defects — the whole-file preimage and the
         # V4A Move source — because `paths` already carries every endpoint.
-        "states=" + "\x1e".join(
-            _path_state_digest(t, task_id) for t in targets),
+        "states=" + "\x1e".join(states),
         f"replace_all={bool(replace_all)}",
         f"occurrences={scope}",
         f"content={_d(content)}",
@@ -2708,21 +2824,35 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
-    # Built once and shared by both gates so the approval card shows the
-    # actual change rather than only the target's name. PRESENTATION ONLY.
-    _preview = _build_write_preview([path], task_id, content=content)
-    # TJS-258: authorization identity, built from the REQUEST — independent
-    # of the preview, so a preview failure cannot weaken it.
-    _identity = _write_request_identity(
-        [path], task_id, mode="write", content=content)
-    protected_err = _check_protected_instruction_write(
-        [path], task_id, _preview, _identity)
-    if protected_err:
-        return tool_error(protected_err)
-    approval_err = _check_approval_required_write(
-        [path], task_id, _preview, _identity)
-    if approval_err:
-        return tool_error(approval_err)
+    # TJS-259 round 7 defect 4: only pay for the preview + state hashing when
+    # a gate actually exists to consume them. An ungated write used to hash
+    # every touched path (1.178s on a 1 GiB file).
+    _gated = _write_gate_applies([path], task_id)
+    _approved_targets: list[str] = []
+    _approved_states: list[str] = []
+    if _gated:
+        # Built once and shared by both gates so the approval card shows the
+        # actual change rather than only the target's name. PRESENTATION ONLY.
+        _preview = _build_write_preview([path], task_id, content=content)
+        # TJS-258: authorization identity, built from the REQUEST — independent
+        # of the preview, so a preview failure cannot weaken it.
+        _approved_targets = _resolve_write_targets([path], task_id)
+        _approved_states = _capture_path_states(_approved_targets, task_id)
+        _unverifiable = _unverifiable_state_error(
+            _approved_targets, _approved_states)
+        if _unverifiable:
+            return tool_error(_unverifiable)
+        _identity = _write_request_identity(
+            [path], task_id, mode="write", content=content,
+            states=_approved_states)
+        protected_err = _check_protected_instruction_write(
+            [path], task_id, _preview, _identity)
+        if protected_err:
+            return tool_error(protected_err)
+        approval_err = _check_approval_required_write(
+            [path], task_id, _preview, _identity)
+        if approval_err:
+            return tool_error(approval_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -2758,6 +2888,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # TJS-259 round 7 defect 3: the gate decided BEFORE this lock, so
+            # a concurrent subagent could have changed the file in between.
+            # The lock exists to serialize exactly those writers, so the
+            # authorized state is re-verified here, inside it, and the write
+            # is abandoned on any difference.
+            if _approved_targets:
+                _drift = _state_drift_error(
+                    _approved_targets, _approved_states, task_id)
+                if _drift:
+                    return tool_error(_drift)
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -2868,29 +3008,42 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return tool_error(binary_doc_err)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
-    _preview = _build_write_preview(
-        _paths_to_check, task_id,
-        old_string=old_string, new_string=new_string,
-        replace_all=replace_all,
-        patch=patch if mode == "patch" else None)
-    # TJS-258: identity from the REQUEST. ``replace_all`` and the occurrence
-    # count are part of it — the snippet diff is identical for
-    # replace_all=True and False, so a preview-derived key let a
-    # one-occurrence approval authorize rewriting every occurrence.
-    _identity = _write_request_identity(
-        _paths_to_check, task_id,
-        mode="patch" if mode == "patch" else "replace",
-        old_string=old_string, new_string=new_string,
-        replace_all=replace_all,
-        patch=patch if mode == "patch" else None)
-    protected_err = _check_protected_instruction_write(
-        _paths_to_check, task_id, _preview, _identity)
-    if protected_err:
-        return tool_error(protected_err)
-    approval_err = _check_approval_required_write(
-        _paths_to_check, task_id, _preview, _identity)
-    if approval_err:
-        return tool_error(approval_err)
+    # TJS-259 round 7 defect 4: skipped entirely when no gate applies, so an
+    # ordinary V4A Delete/Move of a large file stays metadata-bound.
+    _gated = _write_gate_applies(_paths_to_check, task_id)
+    _approved_targets: list[str] = []
+    _approved_states: list[str] = []
+    if _gated:
+        _preview = _build_write_preview(
+            _paths_to_check, task_id,
+            old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
+            patch=patch if mode == "patch" else None)
+        # TJS-258: identity from the REQUEST. ``replace_all`` and the occurrence
+        # count are part of it — the snippet diff is identical for
+        # replace_all=True and False, so a preview-derived key let a
+        # one-occurrence approval authorize rewriting every occurrence.
+        _approved_targets = _resolve_write_targets(_paths_to_check, task_id)
+        _approved_states = _capture_path_states(_approved_targets, task_id)
+        _unverifiable = _unverifiable_state_error(
+            _approved_targets, _approved_states)
+        if _unverifiable:
+            return tool_error(_unverifiable)
+        _identity = _write_request_identity(
+            _paths_to_check, task_id,
+            mode="patch" if mode == "patch" else "replace",
+            old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
+            states=_approved_states,
+            patch=patch if mode == "patch" else None)
+        protected_err = _check_protected_instruction_write(
+            _paths_to_check, task_id, _preview, _identity)
+        if protected_err:
+            return tool_error(protected_err)
+        approval_err = _check_approval_required_write(
+            _paths_to_check, task_id, _preview, _identity)
+        if approval_err:
+            return tool_error(approval_err)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
@@ -2914,6 +3067,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         with ExitStack() as _locks:
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
+
+            # TJS-259 round 7 defect 3: re-verify the authorized state now
+            # that every path is locked. The gate ran before these locks, so
+            # a concurrent subagent could have moved the file underneath the
+            # decision. All-or-nothing, matching the gate's own semantics.
+            if _approved_targets:
+                _drift = _state_drift_error(
+                    _approved_targets, _approved_states, task_id)
+                if _drift:
+                    return tool_error(_drift)
 
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
