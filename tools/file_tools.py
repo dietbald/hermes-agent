@@ -1064,6 +1064,10 @@ def _request_protected_instruction_approval(
         notify_cb = None
 
     if notify_cb is not None:
+        # NOTE (TJS-256): the released "once" grant for this exact write is
+        # redeemed centrally inside _await_gateway_decision(), keyed on the
+        # same `display` string passed as "command" below. Do not redeem it
+        # here as well — that would consume the grant twice.
         approval_data = {
             "command": display,
             "pattern_key": "protected_instruction_file",
