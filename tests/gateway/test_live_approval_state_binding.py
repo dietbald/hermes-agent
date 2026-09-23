@@ -50,9 +50,9 @@ def test_state_is_read_through_the_task_file_backend(monkeypatch, agents_md):
         def __init__(self, inner):
             self._inner = inner
 
-        def read_file_bytes(self, path, *a, **k):
+        def content_digest(self, path, *a, **k):
             seen.append(path)
-            return self._inner.read_file_bytes(path, *a, **k)
+            return self._inner.content_digest(path, *a, **k)
 
         def __getattr__(self, name):
             return getattr(self._inner, name)
@@ -81,11 +81,10 @@ def test_backend_state_change_invalidates_the_grant(monkeypatch, agents_md):
         def __init__(self, inner):
             self._inner = inner
 
-        def read_file_bytes(self, path, *a, **k):
-            res = self._inner.read_file_bytes(path, *a, **k)
+        def content_digest(self, path, *a, **k):
             if str(agents_md) in str(path) and swapped["done"]:
-                res.base64_content = "ZGlmZmVyZW50IHJlbW90ZSBzdGF0ZQo="
-            return res
+                return "d" * 64  # a state the user never reviewed
+            return self._inner.content_digest(path, *a, **k)
 
         def __getattr__(self, name):
             return getattr(self._inner, name)

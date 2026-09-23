@@ -918,6 +918,14 @@ def _path_state_digest(filepath: str, task_id: str = "default") -> str:
     same file by construction, instead of by a backend-type branch that can
     be got wrong later.
 
+    Hashed ON the backend, never transported (round 8, defect 2). Pulling
+    whole-file base64 across the boundary to hash it here materialized the
+    file several times in the agent process — a 32 MiB probe took peak RSS
+    from ~51 MB to ~223 MB and 2.37 s — so a large gated Move/Delete source
+    could exhaust the process, twice (gate, then drift re-check). Only a
+    64-char hex digest crosses now, so cost is bounded by the file's size on
+    the backend alone and no size ceiling is needed.
+
     Three outcomes, deliberately distinct:
 
     ``absent``
@@ -927,39 +935,46 @@ def _path_state_digest(filepath: str, task_id: str = "default") -> str:
         The state could not be determined. Callers must treat this as "cannot
         authorize", never as an identity to compare — see the constant.
     a digest
-        SHA-256 over the backend's byte-exact content.
+        SHA-256 over the file's bytes as the backend sees them.
     """
     try:
         ops = _get_file_ops(task_id)
     except Exception:
         return _STATE_UNREADABLE
     try:
-        result = ops.read_file_bytes(filepath)
+        digest = ops.content_digest(filepath)
     except Exception:
-        return _STATE_UNREADABLE
-    err = getattr(result, "error", None)
-    if err:
-        # A read failure is AMBIGUOUS: missing and unreadable both fail, and
-        # ShellFileOperations reports both as "File not found". Parsing the
-        # message would reintroduce defect 2 (an unreadable file classified
-        # as `absent`, a stable value that matches itself). Ask the backend
-        # directly instead; "cannot tell" resolves to unreadable, so every
-        # ambiguous case fails closed.
-        try:
-            exists = ops.path_exists(filepath)
-        except Exception:
-            exists = None
-        return _STATE_ABSENT if exists is False else _STATE_UNREADABLE
-    payload = getattr(result, "base64_content", None)
-    if payload is None:
-        return _STATE_UNREADABLE
-    return hashlib.sha256(payload.encode("ascii", "ignore")).hexdigest()
+        digest = None
+    if digest:
+        return digest
+    # No digest is AMBIGUOUS: missing and unreadable both fail that way, and
+    # the shell backend reports both as "File not found" on the read path, so
+    # parsing an error message would reintroduce round 7's defect 2 (an
+    # unreadable file classified as `absent`, a stable value that matches
+    # itself). Ask the backend directly; "cannot tell" stays unreadable, so
+    # every ambiguous case fails closed.
+    try:
+        exists = ops.path_exists(filepath)
+    except Exception:
+        exists = None
+    return _STATE_ABSENT if exists is False else _STATE_UNREADABLE
 
 
-def _resolve_write_targets(paths: list[str], task_id: str = "default") -> list[str]:
-    """Sorted, deduplicated resolved targets of a write request."""
+def _resolve_write_targets(paths: list[str], task_id: str = "default", *,
+                           plan: "dict[str, str | None] | None" = None) -> list[str]:
+    """Sorted, deduplicated resolved targets of a write request.
+
+    ``plan`` supplies an already-built path→resolved map so authorization,
+    locking and mutation all derive from ONE resolution. Resolving a second
+    time is what let the written path differ from the reviewed and locked one
+    when a symlinked target was retargeted mid-approval (TJS-259 round 8).
+    """
     resolved: list[str] = []
     for p in paths or []:
+        planned = plan.get(p) if plan is not None else None
+        if planned:
+            resolved.append(planned)
+            continue
         try:
             resolved.append(str(_resolve_path_for_task(p, task_id)))
         except (OSError, ValueError, RuntimeError):
@@ -1031,9 +1046,14 @@ def _write_gate_applies(paths: list[str], task_id: str = "default") -> bool:
     computed when a gate exists to consume it.
 
     Deliberately uses the same predicates the gates themselves use, so the
-    two cannot drift apart on what "gated" means. If it ever does drift, it
-    drifts SAFE: a false negative here hands the gate ``identity=None``, and
-    both gates already fail closed on that.
+    two cannot drift apart on what "gated" means. A drift here is NOT
+    self-correcting: the caller skips both gates entirely when this returns
+    false, so a false negative silently skips approval altogether. (An
+    earlier comment claimed such a case would hand the gate ``identity=None``
+    and fail closed — that was wrong, and the round-8 review was right to
+    call it out.) Any change to either gate's trigger MUST be mirrored here;
+    an exception while deciding therefore answers "gated", the only safe
+    default.
     """
     try:
         enabled, extra = _protected_instruction_config()
@@ -3006,6 +3026,21 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
             return tool_error(binary_doc_err)
+    # TJS-259 round 8 defect 1: ONE immutable resolved-path plan, built here
+    # and used for authorization, locking and mutation alike. Resolving the
+    # raw paths again after the locks were held made the written path a
+    # different file from the reviewed and locked one: retarget a symlinked
+    # AGENTS.md while the card waits, and the code locked/revalidated the
+    # original target while the later re-resolution rewrote the V4A header to
+    # the new one — the unreviewed file was written with no fresh card.
+    # Resolving once removes the second resolution that could disagree.
+    _path_to_resolved: dict[str, str | None] = {}
+    for _p in _paths_to_check:
+        try:
+            _path_to_resolved[_p] = str(_resolve_path_for_task(_p, task_id))
+        except Exception:
+            _path_to_resolved[_p] = None
+
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     # TJS-259 round 7 defect 4: skipped entirely when no gate applies, so an
@@ -3023,7 +3058,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # count are part of it — the snippet diff is identical for
         # replace_all=True and False, so a preview-derived key let a
         # one-occurrence approval authorize rewriting every occurrence.
-        _approved_targets = _resolve_write_targets(_paths_to_check, task_id)
+        _approved_targets = _resolve_write_targets(
+            _paths_to_check, task_id, plan=_path_to_resolved)
         _approved_states = _capture_path_states(_approved_targets, task_id)
         _unverifiable = _unverifiable_state_error(
             _approved_targets, _approved_states)
@@ -3045,16 +3081,14 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         if approval_err:
             return tool_error(approval_err)
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
-        # multi-file V4A patches.
+        # Lock ordering comes from the SAME plan built above — never a fresh
+        # resolution (TJS-259 round 8 defect 1). Ordered + deduplicated so
+        # concurrent callers lock in the same order, preventing deadlock on
+        # overlapping multi-file V4A patches.
         _resolved_paths: list[str] = []
         _seen: set[str] = set()
         for _p in _paths_to_check:
-            try:
-                _r = str(_resolve_path_for_task(_p, task_id))
-            except Exception:
-                _r = None
+            _r = _path_to_resolved.get(_p)
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
                 _seen.add(_r)
@@ -3079,15 +3113,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error(_drift)
 
             # Collect warnings — cross-agent registry first (names sibling),
-            # then per-task tracker as a fallback.
+            # then per-task tracker as a fallback. Uses the ONE plan; the
+            # second resolution that used to happen here is what let the
+            # written path drift away from the reviewed and locked one.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
+                _r = _path_to_resolved.get(_p)
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:
