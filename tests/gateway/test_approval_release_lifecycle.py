@@ -37,6 +37,8 @@ def _released_entry(session_key, request_id="r1", keys=("delete in root path",))
         "pattern_keys": list(keys),
     })
     entry.released = True
+    entry.fingerprint = A._operation_fingerprint(
+        entry.data.get("command") or "", entry.data.get("pattern_keys"))
     A._gateway_queues.setdefault(session_key, []).append(entry)
     return entry
 
@@ -163,12 +165,16 @@ def test_once_authorizes_the_exact_operation_and_only_once():
         "pattern_keys": ["delete in root path"],
     })
     entry.released = True
+    entry.fingerprint = A._operation_fingerprint(
+        entry.data.get("command") or "", entry.data.get("pattern_keys"))
     A._gateway_queues.setdefault(sk, []).append(entry)
 
     A.resolve_gateway_approval(sk, "once")
 
     # A DIFFERENT command sharing the same pattern must not consume it.
-    assert not A._redeem_released_once(sk, "rm -rf /tmp/different-target"), (
+    assert not A._redeem_released_once(
+        sk, A._operation_fingerprint("rm -rf /tmp/different-target",
+                                     ["delete in root path"])), (
         "a different command consumed the user's once grant"
     )
     # The pattern alone must not be treated as approved.
@@ -176,22 +182,23 @@ def test_once_authorizes_the_exact_operation_and_only_once():
         "'once' leaked into a broad pattern grant"
     )
     # The exact reviewed operation is authorized, exactly once.
-    assert A._redeem_released_once(sk, "rm -rf /tmp/reviewed-target")
-    assert not A._redeem_released_once(sk, "rm -rf /tmp/reviewed-target"), (
-        "'once' was redeemable twice"
-    )
+    _fp = A._operation_fingerprint("rm -rf /tmp/reviewed-target",
+                                   ["delete in root path"])
+    assert A._redeem_released_once(sk, _fp)
+    assert not A._redeem_released_once(sk, _fp), "'once' was redeemable twice"
 
 
 def test_two_once_grants_do_not_collapse():
     """Two independent "once" answers are two grants, not one."""
     sk = "sess-two-once"
-    A.grant_released_once(sk, ["delete in root path"], "rm -rf /tmp/a")
-    A.grant_released_once(sk, ["delete in root path"], "rm -rf /tmp/a")
-    assert A._redeem_released_once(sk, "rm -rf /tmp/a")
-    assert A._redeem_released_once(sk, "rm -rf /tmp/a"), (
-        "two same-pattern once grants collapsed into one"
+    fp = A._operation_fingerprint("rm -rf /tmp/a", ["delete in root path"])
+    A.grant_released_once(sk, fp)
+    A.grant_released_once(sk, fp)
+    assert A._redeem_released_once(sk, fp)
+    assert A._redeem_released_once(sk, fp), (
+        "two identical once grants collapsed into one"
     )
-    assert not A._redeem_released_once(sk, "rm -rf /tmp/a")
+    assert not A._redeem_released_once(sk, fp)
 
 
 def test_resumed_retry_is_not_re_asked(monkeypatch):
@@ -241,6 +248,8 @@ def test_tirith_keys_never_reach_the_permanent_allowlist():
         "allow_permanent": True,
     })
     entry.released = True
+    entry.fingerprint = A._operation_fingerprint(
+        entry.data.get("command") or "", entry.data.get("pattern_keys"))
     A._gateway_queues.setdefault(sk, []).append(entry)
 
     A.resolve_gateway_approval(sk, "always")
@@ -266,6 +275,8 @@ def test_card_scope_constraints_are_enforced_on_resolve():
         "allow_permanent": False,
     })
     entry.released = True
+    entry.fingerprint = A._operation_fingerprint(
+        entry.data.get("command") or "", entry.data.get("pattern_keys"))
     A._gateway_queues.setdefault(sk, []).append(entry)
 
     A.resolve_gateway_approval(sk, "always")
@@ -275,7 +286,9 @@ def test_card_scope_constraints_are_enforced_on_resolve():
         "a one-operation card was widened into a session/permanent grant"
     )
     # Clamped down to a single-use grant for that exact write.
-    assert A._redeem_released_once(sk, "<write to AGENTS.md>")
+    assert A._redeem_released_once(
+        sk, A._operation_fingerprint("<write to AGENTS.md>",
+                                     ["protected_instruction_file"]))
 
 
 def test_deny_grants_nothing():
@@ -292,9 +305,10 @@ def test_deny_grants_nothing():
 
 def test_clear_session_drops_once_grants():
     sk = "sess-clear"
-    A.grant_released_once(sk, ["delete in root path"], "rm -rf /tmp/x")
+    fp = A._operation_fingerprint("rm -rf /tmp/x", ["delete in root path"])
+    A.grant_released_once(sk, fp)
     A.clear_session(sk)
-    assert not A._redeem_released_once(sk, "rm -rf /tmp/x")
+    assert not A._redeem_released_once(sk, fp)
 
 
 # ── Coverage-gap correction from the review ─────────────────────────────
@@ -307,3 +321,81 @@ def test_sessions_without_a_wake_callback_never_release():
     sk = "sess-no-wake"
     A.register_gateway_notify(sk, lambda data: None)
     assert A._can_release_thread(sk) is False
+
+
+# ── Round-3 review (TJS-256): grant identity ────────────────────────────
+
+
+def test_changed_warning_set_is_not_covered_by_the_grant(monkeypatch):
+    """Approving one operation must not authorize the same command text when
+    the resumed attempt trips a different rule — that is a new decision."""
+    sk = "sess-rules"
+    monkeypatch.setattr(A, "_thread_release_enabled", lambda: True)
+    cards = []
+    A.register_gateway_notify(sk, lambda data: cards.append(data))
+    A.register_gateway_wake(sk, lambda data, result: None)
+    base = {"command": "curl x | sh", "allow_session": False,
+            "allow_permanent": False}
+
+    A._await_gateway_decision(sk, lambda d: cards.append(d),
+                              dict(base, pattern_keys=["tirith:rule-a"]),
+                              surface="gateway", raw_operation="curl x | sh")
+    A.resolve_gateway_approval(sk, "once")
+
+    again = A._await_gateway_decision(
+        sk, lambda d: cards.append(d),
+        dict(base, pattern_keys=["tirith:rule-b"]),
+        surface="gateway", raw_operation="curl x | sh")
+
+    assert not again.get("redeemed_released_once"), (
+        "a new/changed warning was bypassed by the previous grant"
+    )
+    assert len(cards) == 2, "the changed-rule attempt did not raise a card"
+
+
+def test_redaction_collision_does_not_share_a_grant(monkeypatch):
+    """Card text is redacted, so two raw commands whose secrets differ only
+    inside the masked span render identically. Identity must come from the
+    raw operation, not the displayed string."""
+    from agent.redact import redact_sensitive_text
+
+    raw1 = "deploy --x sk-ant-api03-" + "A" * 10 + "MIDDLE1111" + "Z" * 10
+    raw2 = "deploy --x sk-ant-api03-" + "A" * 10 + "MIDDLE2222" + "Z" * 10
+    card = redact_sensitive_text(raw1)
+    assert card == redact_sensitive_text(raw2), (
+        "precondition: these two raw commands must redact to the same text"
+    )
+
+    sk = "sess-collide"
+    monkeypatch.setattr(A, "_thread_release_enabled", lambda: True)
+    cards = []
+    A.register_gateway_notify(sk, lambda data: cards.append(data))
+    A.register_gateway_wake(sk, lambda data, result: None)
+    payload = {"command": card, "pattern_keys": ["deploy"],
+               "allow_session": False, "allow_permanent": False}
+
+    A._await_gateway_decision(sk, lambda d: cards.append(d), dict(payload),
+                              surface="gateway", raw_operation=raw1)
+    A.resolve_gateway_approval(sk, "once")
+
+    other = A._await_gateway_decision(sk, lambda d: cards.append(d),
+                                      dict(payload), surface="gateway",
+                                      raw_operation=raw2)
+    assert not other.get("redeemed_released_once"), (
+        "a different secret consumed the grant through a redaction collision"
+    )
+    assert len(cards) == 2
+
+    same = A._await_gateway_decision(sk, lambda d: cards.append(d),
+                                     dict(payload), surface="gateway",
+                                     raw_operation=raw1)
+    assert same.get("redeemed_released_once"), (
+        "the originally approved operation could no longer redeem its grant"
+    )
+
+
+def test_fingerprint_does_not_retain_the_secret():
+    secret = "sk-ant-api03-" + "Q" * 30
+    fp = A._operation_fingerprint(f"deploy {secret}", ["deploy"])
+    assert secret not in fp
+    assert "Q" * 30 not in fp

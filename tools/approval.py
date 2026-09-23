@@ -2544,6 +2544,10 @@ _session_approved: dict[str, set] = {}
 # redeemed at most once. A list, not a set: two independent same-pattern
 # "once" answers are two grants and must not collapse into one.
 _released_once_grants: dict[str, list] = {}
+# Process-lifetime salt for operation fingerprints. Random per process so a
+# stored digest is not a stable, offline-guessable handle for the raw command
+# it was derived from (grants live only in this process anyway).
+_OPERATION_FINGERPRINT_SALT = os.urandom(16)
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
@@ -2790,7 +2794,7 @@ def _denial_breaker_addendum(session_key: str) -> str:
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
     __slots__ = ("event", "data", "result", "reason", "acknowledged",
-                 "released")
+                 "released", "fingerprint")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2802,6 +2806,10 @@ class _ApprovalEntry:
         # ``event.wait()`` (TJS-226). The answer must then be delivered by the
         # session's wake callback rather than by unblocking a waiter.
         self.released = False
+        # TJS-256: identity of the operation this card authorizes, used to
+        # redeem a released "once" grant. Never part of `data`, so it is
+        # never rendered to a platform or replayed to a client.
+        self.fingerprint: str = ""
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
@@ -2968,7 +2976,8 @@ def resolve_gateway_approval(session_key: str, choice: str,
                     approve_session(session_key, _k)
             elif _effective == "once":
                 grant_released_once(
-                    session_key, _keys, entry.data.get("command") or "",
+                    session_key,
+                    getattr(entry, "fingerprint", "") or "",
                     entry.data.get("request_id"),
                 )
             elif _effective == "always":
@@ -3164,37 +3173,61 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
         return any(alias in session_approvals for alias in aliases)
 
 
-def grant_released_once(session_key: str, pattern_keys, command: str,
+def _operation_fingerprint(raw_operation: str, pattern_keys) -> str:
+    """Non-reversible identity for one approvable operation (TJS-256).
+
+    Binds the RAW operation text (never the redacted card string) to the set
+    of warnings it was approved under. Two reasons this is a hash and not the
+    text itself:
+
+    * Card payloads are redacted for display, and two different raw commands
+      whose secrets differ only inside the masked span render identically —
+      so displayed text is not identity. The raw text is.
+    * The raw text contains those secrets, and grants outlive the turn, so
+      storing it verbatim would park credentials in module state. A salted
+      digest keeps the comparison exact without retaining the secret.
+
+    The pattern-key set is part of the identity: if the resumed attempt
+    trips a different or additional rule, it is not the operation the user
+    reviewed and must raise a fresh card.
+    """
+    keys = sorted({str(k) for k in (pattern_keys or []) if k})
+    payload = "\x00".join([raw_operation or ""] + keys).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(_OPERATION_FINGERPRINT_SALT + payload).hexdigest()
+
+
+def grant_released_once(session_key: str, fingerprint: str,
                         request_id: Optional[str] = None) -> None:
     """Record a single-use grant for a released approval answered "once".
 
-    Bound to *command* — the exact operation string the user saw on the card
-    — so the resumed turn's retry of THAT operation is authorized and nothing
-    else is. Appended, never merged: two "once" answers are two grants.
+    Bound to *fingerprint* (raw operation + warning set) so the resumed
+    turn's retry of THAT operation under THOSE warnings is authorized and
+    nothing else is. Appended, never merged: two "once" answers are two
+    grants.
     """
-    keys = [k for k in (pattern_keys or []) if k]
+    if not fingerprint:
+        return
     with _lock:
         _released_once_grants.setdefault(session_key, []).append({
-            "command": command,
-            "keys": set(keys),
+            "fingerprint": fingerprint,
             "request_id": request_id,
         })
 
 
-def _redeem_released_once(session_key: str, command: str) -> bool:
-    """Consume a released "once" grant matching this exact command.
+def _redeem_released_once(session_key: str, fingerprint: str) -> bool:
+    """Consume a released "once" grant matching this exact operation.
 
     Returns True when the resumed turn is re-attempting the very operation
-    the user approved. Each grant is redeemed at most once.
+    the user approved, under the same warnings. Redeemed at most once.
     """
-    if not command:
+    if not fingerprint:
         return False
     with _lock:
         grants = _released_once_grants.get(session_key)
         if not grants:
             return False
         for i, grant in enumerate(grants):
-            if grant.get("command") == command:
+            if grant.get("fingerprint") == fingerprint:
                 grants.pop(i)
                 if not grants:
                     _released_once_grants.pop(session_key, None)
@@ -4033,7 +4066,10 @@ def _run_approval_gate(
                 "allow_session": True,
             }
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key, notify_cb, approval_data, surface="gateway",
+                # TJS-256: approval_data["command"] is redacted for display;
+                # identity must come from the raw text.
+                raw_operation=display_target,
             )
             if decision.get("notify_failed"):
                 return {
@@ -4690,7 +4726,8 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway",
-                            allow_release: bool = True) -> dict:
+                            allow_release: bool = True,
+                            raw_operation: Optional[str] = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -4708,6 +4745,30 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+
+    # ── TJS-256: operation identity, computed before anything else ──
+    # Built from the RAW operation (the card's "command" is redacted for
+    # display, and two different raw commands whose secrets differ only
+    # inside the masked span render to the SAME string) plus the warning set
+    # (a retry that trips a different or extra rule is not the operation the
+    # user reviewed). Salted digest: exact comparison, no secret retained.
+    _fingerprint = _operation_fingerprint(
+        raw_operation if raw_operation is not None
+        else (approval_data.get("command") or ""),
+        all_keys if all_keys else ([primary_key] if primary_key else []),
+    )
+    # Redeem a released "once" grant BEFORE coalescing or enqueueing. The
+    # wake turn re-attempts the operation, so without this every released
+    # consumer would raise a SECOND card for a decision the user already
+    # gave. Must precede coalescing, or the retry can instead coalesce onto
+    # an unrelated pending card and never redeem at all.
+    if _redeem_released_once(session_key, _fingerprint):
+        logger.info(
+            "Redeemed released 'once' grant for session %s — resuming the "
+            "approved operation without re-asking", session_key,
+        )
+        return {"resolved": True, "choice": "once", "reason": None,
+                "redeemed_released_once": True}
 
     # ── Coalesce identical concurrent approvals (one prompt, one answer) ──
     # Parallel tool calls (a parallel terminal batch, execute_code RPC
@@ -4728,12 +4789,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     leader = None
     with _lock:
         for existing in _gateway_queues.get(session_key, []):
-            data = existing.data
-            if (
-                data.get("command") == approval_data.get("command")
-                and list(data.get("pattern_keys") or [])
-                == list(approval_data.get("pattern_keys") or [])
-            ):
+            # TJS-256: match on the operation fingerprint. The redacted
+            # "command" text is not identity — two different raw operations
+            # can render identically once their secrets are masked, and
+            # coalescing them would let one command inherit another's
+            # answer.
+            if getattr(existing, "fingerprint", "") == _fingerprint:
                 leader = existing
                 break
     if leader is not None:
@@ -4762,20 +4823,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         # Leader resolved "once" — fall through to a fresh prompt below.
 
     entry = _ApprovalEntry(approval_data)
-    # TJS-256: before raising anything, check whether this exact operation is
-    # the one the user already approved "once" on a released card. The wake
-    # turn re-attempts the operation, so without redeeming here every
-    # released consumer would raise a SECOND card for a decision the user
-    # already gave. Done at this single choke point so every caller of
-    # _await_gateway_decision is covered, not just the one that was reported.
-    if _redeem_released_once(session_key, approval_data.get("command") or ""):
-        logger.info(
-            "Redeemed released 'once' grant for session %s — resuming the "
-            "approved operation without re-asking", session_key,
-        )
-        return {"resolved": True, "choice": "once", "reason": None,
-                "redeemed_released_once": True}
-
+    entry.fingerprint = _fingerprint
     # TJS-226: decide release BEFORE the entry is reachable by a resolver.
     # notify_cb below hands the card to the platform, and the user can tap
     # before notify_cb even returns. If entry.released were still False at
@@ -5384,7 +5432,10 @@ def check_all_command_guards(command: str, env_type: str,
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key, notify_cb, approval_data, surface="gateway",
+                # TJS-256: approval_data["command"] is redacted for display;
+                # identity must come from the raw text.
+                raw_operation=command,
             )
             if decision.get("notify_failed"):
                 return {
@@ -5949,7 +6000,9 @@ def check_execute_code_guard(code: str, env_type: str,
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
     decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+        session_key, notify_cb, approval_data, surface="gateway",
+        # TJS-256: card text is redacted; identity comes from the raw code.
+        raw_operation=code,
     )
     if decision.get("notify_failed"):
         return {
