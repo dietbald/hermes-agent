@@ -5771,6 +5771,7 @@ class TurnRunner:
                 provider_sort=pr.get("sort"),
                 provider_require_parameters=pr.get("require_parameters", False),
                 provider_data_collection=pr.get("data_collection"),
+                provider_zdr=pr.get("zdr", False) is True,
                 session_id=ctx.session_id,
                 platform=platform_key,
                 user_id=ctx.source.user_id,
@@ -6105,6 +6106,7 @@ class TurnRunner:
         # to the user immediately.
         from tools.approval import (
             register_gateway_notify,
+            register_gateway_wake,
             reset_current_session_key,
             set_current_session_key,
             unregister_gateway_notify,
@@ -6360,6 +6362,68 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+
+        # TJS-226: resume path for an approval that released the agent thread.
+        # Deliberately registered WITHOUT a matching unregister in the finally
+        # block below: the whole point is that the answer arrives after this
+        # turn has ended, so the callback must outlive the turn. It is
+        # re-registered (same key, same closure shape) on every turn, and the
+        # session-boundary teardown drops the queue entries it would fire for.
+        _wake_source = ctx.source
+        _wake_loop = ctx._loop_for_step
+
+        def _approval_wake_sync(approval_data: dict, decision: dict) -> None:
+            """Push a new turn carrying the user's decision into the session.
+
+            Runs on the platform's button-handler thread, not an agent
+            thread. Bridges to the gateway loop and hands the agent a plain
+            user-visible instruction describing what was decided.
+            """
+            choice = str(decision.get("choice") or "")
+            reason = str(decision.get("reason") or "")
+            desc = str(approval_data.get("description") or "the pending action")
+            if choice == "deny":
+                verdict = f"DENIED the pending approval for: {desc}."
+                if reason:
+                    verdict += f' Reason given: "{reason}".'
+                verdict += (
+                    " Do not perform that action. Continue with the rest of "
+                    "your work, or report why you cannot."
+                )
+            else:
+                verdict = (
+                    f"APPROVED the pending approval for: {desc} "
+                    f"(scope: {choice or 'once'}). Resume the work that was "
+                    "waiting on this approval and carry it out now."
+                )
+            text = f"[approval resolved] The user has {verdict}"
+
+            try:
+                from gateway.wake import deliver_wake
+
+                adapter = self._runner._adapter_for_source(_wake_source)
+                if adapter is None:
+                    logger.error(
+                        "Approval wake: no adapter for session %s — the "
+                        "user's decision (%s) cannot resume the run",
+                        _approval_session_key, choice,
+                    )
+                    return
+                fut = safe_schedule_threadsafe(
+                    deliver_wake(adapter, text=text, source=_wake_source),
+                    _wake_loop,
+                    logger=logger,
+                    log_message="Approval wake scheduling error",
+                )
+                if fut is not None:
+                    fut.result(timeout=30)
+            except Exception:
+                logger.error(
+                    "Approval wake delivery failed for session %s (choice %s)",
+                    _approval_session_key, choice, exc_info=True,
+                )
+
+        register_gateway_wake(_approval_session_key, _approval_wake_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -12257,6 +12321,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         mark_failed,
                         row["obligation_id"],
                         str(getattr(result, "error", "") or "send failed"),
+                        retryable=bool(getattr(result, "retryable", False)),
+                        retry_after=getattr(result, "retry_after", None),
                     )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
@@ -12335,6 +12401,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc_info=True,
                 )
         return await self._redeliver_claimed_obligations(sendable)
+
+    async def _delivery_obligation_retry_watcher(self, interval: float = 2.0) -> None:
+        """Retry due transient delivery obligations for the life of the gateway.
+
+        The ledger owns backoff and cancellation. This watcher only enumerates
+        currently connected transport identities and asks the existing atomic
+        claim/send path to drain what is due. It deliberately survives without a
+        platform reconnect or process restart: a Telegram 429/read timeout can
+        leave polling healthy, so neither older recovery trigger is sufficient.
+        """
+        while self._running:
+            identities = [
+                (platform, None) for platform in list(self.adapters.keys())
+            ]
+            for profile, adapters in list(
+                (getattr(self, "_profile_adapters", None) or {}).items()
+            ):
+                identities.extend(
+                    (platform, profile) for platform in list(adapters.keys())
+                )
+            for platform, profile in identities:
+                if not self._running:
+                    return
+                try:
+                    await self._redeliver_failed_obligations_for_platform(
+                        platform,
+                        profile=profile,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "delivery-obligation retry sweep failed for %s%s",
+                        platform.value,
+                        f" profile={profile}" if profile else "",
+                    )
+            await asyncio.sleep(interval)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -13545,6 +13648,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # _ensure_reconnect_watcher_running never mistakes a superseded handle
         # for a dead watcher and spawns a duplicate.
         self._spawn_reconnect_watcher()
+
+        # Retry transient final-response obligations independently of platform
+        # reconnects. Telegram can keep getUpdates healthy while sendMessage is
+        # rate-limited, so reconnect-only replay strands replies indefinitely.
+        self._spawn_supervised(
+            self._delivery_obligation_retry_watcher,
+            "delivery_obligation_retry_watcher",
+        )
 
         # Start background handoff watcher — picks up CLI sessions marked
         # handoff_state='pending' in state.db and re-binds them to the
@@ -20051,7 +20162,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
-                                    max_iterations=4,
+                                    max_iterations=1000,
                                     quiet_mode=True,
                                     skip_memory=not _hyg_checkpoint_required,
                                     enabled_toolsets=["memory"],
@@ -23089,6 +23200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_sort=pr.get("sort"),
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
+                    provider_zdr=pr.get("zdr", False) is True,
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,

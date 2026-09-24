@@ -978,10 +978,14 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
     try:
-        from tools.approval import unregister_gateway_notify
+        from tools.approval import (
+            unregister_gateway_notify,
+            unregister_gateway_wake,
+        )
 
         if key := session.get("session_key"):
             unregister_gateway_notify(key)
+            unregister_gateway_wake(key)
     except Exception:
         pass
     try:
@@ -2574,6 +2578,89 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     _emit("approval.request", sid, payload)
 
 
+def _approval_wake_text(approval_data: dict, decision: dict) -> str:
+    """Build the wake turn text for a resolved approval (mirrors gateway/run.py).
+
+    Same wording as the chat-gateway path so the model sees one consistent
+    instruction regardless of which surface raised the card (TJS-253).
+    """
+    choice = str(decision.get("choice") or "")
+    reason = str(decision.get("reason") or "")
+    desc = str(approval_data.get("description") or "the pending action")
+    if choice == "deny":
+        verdict = f"DENIED the pending approval for: {desc}."
+        if reason:
+            verdict += f' Reason given: "{reason}".'
+        verdict += (
+            " Do not perform that action. Continue with the rest of "
+            "your work, or report why you cannot."
+        )
+    else:
+        verdict = (
+            f"APPROVED the pending approval for: {desc} "
+            f"(scope: {choice or 'once'}). Resume the work that was "
+            "waiting on this approval and carry it out now."
+        )
+    return f"[approval resolved] The user has {verdict}"
+
+
+def _emit_approval_wake(sid: str, approval_data: dict, decision: dict) -> None:
+    """Resume a dashboard/TUI session after an approval it raised was answered.
+
+    Registered with ``register_gateway_wake`` alongside the notify callback.
+    Its presence is what lets ``tools.approval`` release the agent thread
+    instead of parking it on a bounded ``approvals.timeout`` wait that expires
+    into a wrong denial (TJS-222 / TJS-253). Called from the RPC thread that
+    handled ``approval.respond``; never raises — the caller must still answer
+    the client.
+    """
+    text = _approval_wake_text(approval_data, decision)
+    with _sessions_lock:
+        session = _sessions.get(sid)
+    if session is None or session.get("_closing") or session.get("_finalized"):
+        logger.error(
+            "Approval wake: session %s is gone — the user's decision (%s) "
+            "cannot resume the run",
+            sid, decision.get("choice"),
+        )
+        return
+    rid = f"__approval_wake__{int(time.time() * 1000)}"
+    with session["history_lock"]:
+        if session.get("running"):
+            # The released turn is still unwinding (or another turn claimed the
+            # session). Queue the decision as the very next turn instead of
+            # racing it — same contract as a mid-turn user message.
+            _enqueue_prompt(session, text, session.get("transport"))
+            return
+        session["running"] = True
+    try:
+        _emit("message.start", sid)
+        _run_prompt_submit(rid, sid, session, text)
+    except Exception:
+        with session["history_lock"]:
+            session["running"] = False
+        logger.error(
+            "Approval wake dispatch failed for session %s (choice %s)",
+            sid, decision.get("choice"), exc_info=True,
+        )
+
+
+def _register_approval_callbacks(sid: str, key: str) -> None:
+    """Register BOTH approval callbacks for a session key.
+
+    Notify alone leaves the session on the blocking fallback path; the wake
+    callback is what makes thread release safe and is therefore registered on
+    every path that registers notify (TJS-253).
+    """
+    from tools.approval import register_gateway_notify, register_gateway_wake
+
+    register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+    register_gateway_wake(
+        key,
+        lambda data, decision: _emit_approval_wake(sid, data, decision),
+    )
+
+
 def _status_update(sid: str, kind: str, text: str | None = None):
     body = (text if text is not None else kind).strip()
     if not body:
@@ -3003,14 +3090,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # fleets accumulate until the OS refuses new process spawns.
 
             try:
-                from tools.approval import (
-                    register_gateway_notify,
-                    load_permanent_allowlist,
-                )
+                from tools.approval import load_permanent_allowlist
 
-                register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
-                )
+                _register_approval_callbacks(sid, key)
                 notify_registered = True
                 load_permanent_allowlist()
             except Exception:
@@ -3075,9 +3157,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 replaced = _sessions.get(sid) is not current
             if replaced and notify_registered:
                 try:
-                    from tools.approval import unregister_gateway_notify
+                    from tools.approval import (
+                        unregister_gateway_notify,
+                        unregister_gateway_wake,
+                    )
 
                     unregister_gateway_notify(key)
+                    unregister_gateway_wake(key)
                 except Exception:
                     pass
             # Dedicated profile handle: hand it to the agent that will actually
@@ -6597,12 +6683,13 @@ def _sync_session_key_after_compress(
             disable_session_yolo,
             enable_session_yolo,
             is_session_yolo_enabled,
-            register_gateway_notify,
             unregister_gateway_notify,
+            unregister_gateway_wake,
         )
 
         try:
             unregister_gateway_notify(old_key)
+            unregister_gateway_wake(old_key)
         except Exception:
             pass
         session["session_key"] = new_session_id
@@ -6617,10 +6704,7 @@ def _sync_session_key_after_compress(
             except Exception:
                 pass
         try:
-            register_gateway_notify(
-                new_session_id,
-                lambda data: _emit_approval_request(sid, data),
-            )
+            _register_approval_callbacks(sid, new_session_id)
         except Exception:
             pass
     except Exception:
@@ -7854,6 +7938,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
             agent, "provider_require_parameters", False
         ),
         "provider_data_collection": getattr(agent, "provider_data_collection", None),
+        "provider_zdr": getattr(agent, "provider_zdr", False) is True,
         "openrouter_min_coding_score": getattr(agent, "openrouter_min_coding_score", None),
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
@@ -8347,6 +8432,7 @@ def _make_agent(
         provider_sort=_pr.get("sort"),
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
+        provider_zdr=_pr.get("zdr", False) is True,
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
@@ -8457,9 +8543,9 @@ def _init_session(
     # deferred-build path in _start_agent_build for the full rationale
     # (per-worker MCP fleets accumulating across retained sessions).
     try:
-        from tools.approval import register_gateway_notify, load_permanent_allowlist
+        from tools.approval import load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+        _register_approval_callbacks(sid, key)
         load_permanent_allowlist()
     except Exception:
         pass

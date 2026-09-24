@@ -583,6 +583,33 @@ class FileOperations(ABC):
         """Read complete binary content as base64 across the backend boundary."""
         return ReadResult(error="Binary reads are not implemented for this backend")
 
+    def path_exists(self, path: str) -> Optional[bool]:
+        """Whether *path* exists, as seen by THIS backend.
+
+        ``True``/``False`` are answers; ``None`` means "cannot tell" and
+        callers must fail closed on it. Needed because a read failure is
+        ambiguous — a missing file and an unreadable one both fail — and an
+        approval identity must never treat those as the same state
+        (TJS-259). The default is ``None`` so a backend that has not
+        implemented this can only ever cause a block, never a false match.
+        """
+        return None
+
+    def content_digest(self, path: str) -> Optional[str]:
+        """SHA-256 hex of *path*'s bytes, computed ON the backend.
+
+        ``None`` means "could not compute" and callers must fail closed.
+
+        Exists so an approval identity can bind a file's contents WITHOUT
+        transporting them (TJS-259 round 8). Reading whole-file base64 across
+        the backend boundary to hash it locally materialized the file several
+        times over in the agent process — a 32 MiB probe moved peak RSS from
+        ~51 MB to ~223 MB and took 2.37 s — which a large gated Move/Delete
+        source could turn into process exhaustion. Only the 64-char hex ever
+        crosses the boundary here, so cost is bounded regardless of file size.
+        """
+        return None
+
     @abstractmethod
     def write_file(self, path: str, content: str,
                    pre_content: Optional[str] = None) -> WriteResult:
@@ -1888,6 +1915,73 @@ class ShellFileOperations(FileOperations):
         ``delete_path(recursive=True)`` for trees.
         """
         return self._python_delete(path, recursive=False)
+
+    def path_exists(self, path: str) -> Optional[bool]:
+        """Backend-side existence probe (see the base-class contract).
+
+        ``[ -e ]`` is a stat, not an open, so it answers for unreadable
+        files, FIFOs and devices without the blocking risk that makes the
+        read path unusable for this question. Distinguishing "missing" from
+        "unreadable" is what stops an unverifiable state being mistaken for
+        an empty/absent one in an approval identity (TJS-259).
+        """
+        try:
+            arg = self._escape_shell_arg(self._expand_path(path))
+            result = self._exec(f"if [ -e {arg} ]; then echo yes; else echo no; fi")
+        except Exception:
+            return None
+        if result.exit_code != 0:
+            return None
+        answer = _strip_terminal_fence_leaks(result.stdout).strip()
+        if answer.endswith("yes"):
+            return True
+        if answer.endswith("no"):
+            return False
+        return None
+
+    _DIGEST_UNREADABLE = "__hermes_digest_unreadable__"
+
+    def content_digest(self, path: str) -> Optional[str]:
+        """Backend-side streaming SHA-256 (see the base-class contract).
+
+        Streamed in fixed chunks on the backend, so peak memory is the chunk
+        size on both sides no matter how large the file is; only the hex
+        digest crosses the boundary. ``[ -f ]``-equivalent guarding comes from
+        opening in binary and letting a non-regular/unreadable path raise —
+        both report the sentinel, which maps to ``None`` (fail closed) rather
+        than to a digest.
+        """
+        target = self._expand_path(path)
+        snippet = (
+            "import hashlib, sys\n"
+            f"p = {target!r}\n"
+            "try:\n"
+            "    h = hashlib.sha256()\n"
+            "    with open(p, 'rb') as fh:\n"
+            "        while True:\n"
+            "            b = fh.read(1048576)\n"
+            "            if not b:\n"
+            "                break\n"
+            "            h.update(b)\n"
+            "    print(h.hexdigest())\n"
+            "except Exception:\n"
+            f"    print({self._DIGEST_UNREADABLE!r})\n"
+        )
+        try:
+            result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+            if result.exit_code != 0 and "python3" in (result.stdout or ""):
+                result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+        except Exception:
+            return None
+        if result.exit_code != 0:
+            return None
+        answer = _strip_terminal_fence_leaks(result.stdout).strip().splitlines()
+        if not answer:
+            return None
+        digest = answer[-1].strip()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            return None
+        return digest
 
     def delete_path(self, path: str, recursive: bool = False) -> WriteResult:
         """Cross-platform delete that handles files and (with recursive=True)

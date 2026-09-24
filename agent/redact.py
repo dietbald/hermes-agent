@@ -40,6 +40,11 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "session",
     "secret",
     "key",
+    "deploy_key",
+    "ssh_key",
+    "signing_key",
+    "webhook_secret",
+    "bot_token",
     "code",           # OAuth authorization codes
     "signature",      # pre-signed URL signatures
     "x-amz-signature",
@@ -63,6 +68,11 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "private_key",
     "authorization",
     "key",
+    "deploy_key",
+    "ssh_key",
+    "signing_key",
+    "webhook_secret",
+    "bot_token",
 })
 
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
@@ -220,7 +230,10 @@ _CFG_ANCHORED_RE = re.compile(
 # from the key set so ``Authorization:`` / ``author:`` don't match (the former
 # is masked by _AUTH_HEADER_RE); ``auth_token``/``auth-token`` still match via
 # the ``token`` keyword. Quoted values defer to _JSON_FIELD_RE via the lookahead.
-_YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
+_YAML_CFG_NAMES = (
+    r"(?:api[ _.\-]?key|deploy[ _.\-]?key|ssh[ _.\-]?key|"
+    r"signing[ _.\-]?key|token|secret|passwd|password|credential)"
+)
 # NOTE(perf): possessive quantifiers wherever the successor is disjoint; the
 # leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
 _YAML_ASSIGN_RE = re.compile(
@@ -316,7 +329,7 @@ def _key_has_secret_keyword(key: str) -> bool:
     return False
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|deploy_key|ssh_key|signing_key|webhook_secret|bot_token|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,
@@ -797,15 +810,19 @@ def redact_sensitive_text(
     private keys, DB connstrings, JWTs, and URL secrets are still redacted.
 
     Set file_read=True for file *content* returned to the agent (read_file /
-    search_files / cat). Secrets are STILL redacted — they are never exposed —
-    but prefix-matched credentials are replaced with a non-reusable sentinel
-    (``«redacted:ghp_…»``) instead of a head/tail-preserving mask
-    (``ghp_S1...Pn2T``). The old mask looked like a real-but-truncated key, so
-    an agent reading it from config.yaml and writing it back silently corrupted
-    the stored credential into a dead 13-char value → 401 (issue #35519). The
-    sentinel is syntactically invalid as a token, so it can't be mistaken for a
-    usable key or written back as one. Implies code_file=True (config/data
-    files shouldn't trigger the source-code ENV/JSON false-positive paths).
+    search_files / cat). Prefix-matched credentials are replaced with a
+    non-reusable sentinel (``«redacted:ghp_…»``) instead of a head/tail-
+    preserving mask (``ghp_S1...Pn2T``). The old mask looked like a real-but-
+    truncated key, so an agent reading it from config.yaml and writing it back
+    silently corrupted the stored credential into a dead 13-char value → 401
+    (issue #35519). The sentinel is syntactically invalid as a token, so it
+    can't be mistaken for a usable key or written back as one.
+
+    WARNING: file_read implies code_file=True to avoid ENV/JSON/YAML assignment
+    false positives in source and fixture files. Therefore opaque assignment
+    values with no recognized credential shape are not key-name-redacted in
+    this mode. Security boundaries that render config content must call the
+    default mode (normally with force=True), not file_read=True.
 
     Performance: each regex pattern is gated behind a cheap substring
     pre-check (e.g. ``"=" in text`` for ENV assignments, ``"://" in text``
@@ -829,6 +846,18 @@ def redact_sensitive_text(
     # paths either (it's config/data, not log lines).
     if file_read:
         code_file = True
+
+    def _sub_non_url_lines(pattern, repl, value):
+        """Apply a config regex per line without touching web URL lines.
+
+        URL query credentials pass through by design, but a URL on one line
+        must not disable config-secret redaction on every other line in the
+        same log/tool-output block.
+        """
+        return "".join(
+            line if "://" in line else pattern.sub(repl, line)
+            for line in value.splitlines(keepends=True)
+        )
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -867,9 +896,8 @@ def redact_sensitive_text(
             # function; _redact_strict_url_credentials handles the opt-in
             # case). The uppercase regex above is all-caps-only, so it never
             # matches URL params; the lowercase one would (issue #77484).
-            if "://" not in text:
-                text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
-            # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
+            text = _sub_non_url_lines(_ENV_ASSIGN_LOWER_RE, _redact_env, text)
+            # Lowercase/dotted config keys (issue #16413). Skip URL lines —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
             # connection-string passwords.
@@ -881,9 +909,9 @@ def redact_sensitive_text(
             # (e.g. base64/hex blobs in compaction payloads); the linear
             # keyword scan prevents that pathological path on secret-free
             # text.
-            if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+            if _CFG_SECRET_WORD_RE.search(text):
+                text = _sub_non_url_lines(_CFG_DOTTED_RE, _redact_env, text)
+                text = _sub_non_url_lines(_CFG_ANCHORED_RE, _redact_env, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
@@ -899,8 +927,8 @@ def redact_sensitive_text(
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
-        # quotes). Skip URLs — web-URL query params pass through by design.
-        if ":" in text and "://" not in text:
+        # quotes). Skip URL lines — web-URL query params pass through by design.
+        if ":" in text:
             def _redact_yaml(m):
                 key, sep, value = m.group(1), m.group(2), m.group(3)
                 # Same programmatic-env-lookup exception as _redact_env above
@@ -914,7 +942,7 @@ def redact_sensitive_text(
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
                 return f"{key}{sep}{_mask_token(value)}"
-            text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
+            text = _sub_non_url_lines(_YAML_ASSIGN_RE, _redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the

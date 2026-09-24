@@ -3,6 +3,7 @@
 
 import base64
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
@@ -840,8 +842,507 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+# Budget for the diff shown on an approval card. Adapters apply their OWN
+# caps on top of this and they vary a lot (base ``_EA_CMD_BUDGET`` is 3000,
+# WhatsApp truncates the command at 800 and the whole body at 1024), so a
+# trailing "[truncated]" marker cannot be relied on to survive. Hence two
+# defenses: keep this well under the smallest plausible cap, AND lead with
+# the summary line (see ``_build_write_preview``) so the file name and
+# change size are the first thing any truncation keeps.
+_WRITE_PREVIEW_BUDGET = 1500
+
+
+class _WritePreview(NamedTuple):
+    """What an approval card should show about a pending content write.
+
+    ``diff`` is the (already truncated + redacted) text rendered in the
+    card's fenced block; ``summary`` is the one-line ``+N/-M lines`` shape
+    folded into the card's reason text.
+
+    A preview is PRESENTATION ONLY (TJS-258). It deliberately carries no
+    identity field any more: every identity defect in the TJS-256 review
+    came from keying a grant on something the preview produced (the card's
+    command text, the redacted diff, the snippet diff body). Authorization
+    identity is built separately by ``_write_request_identity`` from the
+    write REQUEST, before any preview or redaction exists.
+    """
+    diff: str
+    summary: str
+
+
+def _current_file_text(filepath: str, task_id: str = "default") -> str:
+    """Best-effort read of a file's current text; ``""`` when unreadable.
+
+    Used only to build an approval preview, so every failure (missing file,
+    permissions, binary bytes) degrades to "treat as empty / new file"
+    rather than blocking the gate.
+    """
+    try:
+        resolved = Path(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError, RuntimeError):
+        resolved = Path(_expand_tilde(filepath))
+    try:
+        return resolved.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
+#: Sentinel for a path whose current state could not be read. It is NOT a
+#: usable identity component: two unreadable states are not "the same state",
+#: so a gate that sees it must BLOCK rather than compare (TJS-259 round 7,
+#: defect 2 — a stable ``unreadable`` literal matched itself and let a grant
+#: be redeemed against changed bytes of a write-only file).
+_STATE_UNREADABLE = "unreadable"
+_STATE_ABSENT = "absent"
+
+
+def _path_state_digest(filepath: str, task_id: str = "default") -> str:
+    """Digest of a path's CURRENT bytes, for the authorization identity.
+
+    TJS-259 round 6. The user does not approve a request in the abstract; they
+    approve a *change* — the request applied to the state the card showed
+    them. A released grant has no expiry, so binding only the request lets the
+    source state move underneath a waiting card: edit the target (or a
+    ``*** Move File:`` source) while the card waits and the resumed call
+    rebuilds an identical request identity, redeems the grant, and writes
+    something the user was never shown. Both were reproduced live.
+
+    Read through the BACKEND, not the host (round 7, defect 1). Previously
+    this called host ``Path.exists()``/``open()`` while the write itself goes
+    through ``ShellFileOperations`` in whatever terminal environment the task
+    owns. Under a container backend those are two different filesystems: two
+    distinct remote states both mapped to the same absent host path, so the
+    digests collided and the grant was reused. Going through
+    ``_get_file_ops(task_id)`` — the exact object that performs the write —
+    makes "the state I hashed" and "the state I am about to overwrite" the
+    same file by construction, instead of by a backend-type branch that can
+    be got wrong later.
+
+    Hashed ON the backend, never transported (round 8, defect 2). Pulling
+    whole-file base64 across the boundary to hash it here materialized the
+    file several times in the agent process — a 32 MiB probe took peak RSS
+    from ~51 MB to ~223 MB and 2.37 s — so a large gated Move/Delete source
+    could exhaust the process, twice (gate, then drift re-check). Only a
+    64-char hex digest crosses now, so cost is bounded by the file's size on
+    the backend alone and no size ceiling is needed.
+
+    Three outcomes, deliberately distinct:
+
+    ``absent``
+        No such path. Different from an empty file, which is a state the user
+        would decide about differently.
+    :data:`_STATE_UNREADABLE`
+        The state could not be determined. Callers must treat this as "cannot
+        authorize", never as an identity to compare — see the constant.
+    a digest
+        SHA-256 over the file's bytes as the backend sees them.
+    """
+    try:
+        ops = _get_file_ops(task_id)
+    except Exception:
+        return _STATE_UNREADABLE
+    try:
+        digest = ops.content_digest(filepath)
+    except Exception:
+        digest = None
+    if digest:
+        return digest
+    # No digest is AMBIGUOUS: missing and unreadable both fail that way, and
+    # the shell backend reports both as "File not found" on the read path, so
+    # parsing an error message would reintroduce round 7's defect 2 (an
+    # unreadable file classified as `absent`, a stable value that matches
+    # itself). Ask the backend directly; "cannot tell" stays unreadable, so
+    # every ambiguous case fails closed.
+    try:
+        exists = ops.path_exists(filepath)
+    except Exception:
+        exists = None
+    return _STATE_ABSENT if exists is False else _STATE_UNREADABLE
+
+
+def _resolve_write_targets(paths: list[str], task_id: str = "default", *,
+                           plan: "dict[str, str | None] | None" = None) -> list[str]:
+    """Sorted, deduplicated resolved targets of a write request.
+
+    ``plan`` supplies an already-built path→resolved map so authorization,
+    locking and mutation all derive from ONE resolution. Resolving a second
+    time is what let the written path differ from the reviewed and locked one
+    when a symlinked target was retargeted mid-approval (TJS-259 round 8).
+    """
+    resolved: list[str] = []
+    for p in paths or []:
+        planned = plan.get(p) if plan is not None else None
+        if planned:
+            resolved.append(planned)
+            continue
+        try:
+            resolved.append(str(_resolve_path_for_task(p, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            # An unresolvable path is still a distinct target; use the
+            # normalized input rather than dropping it (dropping would make
+            # two different requests look identical).
+            resolved.append(os.path.normpath(_expand_tilde(p)))
+    return sorted(dict.fromkeys(resolved))
+
+
+def _capture_path_states(targets: list[str],
+                         task_id: str = "default") -> list[str]:
+    """State of each target, positionally aligned with *targets*."""
+    return [_path_state_digest(t, task_id) for t in targets]
+
+
+def _unverifiable_state_error(targets: list[str], states: list[str]) -> str | None:
+    """BLOCKED message when any target's state cannot be established.
+
+    Fail closed, and fail *loudly*: raising a card the user cannot meaningfully
+    answer (the card would describe a change against a state nobody can read)
+    would loop forever, because the state stays unreadable on every resume. A
+    plain block names the path and ends the attempt.
+    """
+    bad = [t for t, s in zip(targets, states) if s == _STATE_UNREADABLE]
+    if not bad:
+        return None
+    return (
+        "BLOCKED: cannot verify the current contents of "
+        f"{', '.join(bad)}, so this write cannot be authorized — an approval "
+        "must be bound to the state it was reviewed against. Fix the path's "
+        "readability (permissions, file type, backend availability) and retry."
+    )
+
+
+def _state_drift_error(targets: list[str], approved_states: list[str],
+                       task_id: str = "default") -> str | None:
+    """BLOCKED message when a target changed after the gate decided.
+
+    TJS-259 round 7, defect 3. The gate runs before ``file_state.lock_path``,
+    so between "this identity redeemed the grant" and "the bytes are written"
+    another writer — a concurrent subagent, which is a supported and
+    deliberately serialized case — can change the file. The lock exists for
+    exactly those writers, so the check has to happen *inside* it. Re-reading
+    here and refusing on any difference closes the window: whatever the gate
+    authorized is what gets overwritten, or nothing is.
+    """
+    current = _capture_path_states(targets, task_id)
+    changed = [t for t, before, after in zip(targets, approved_states, current)
+               if before != after or after == _STATE_UNREADABLE]
+    if not changed:
+        return None
+    return (
+        f"BLOCKED: {', '.join(changed)} changed after this write was "
+        "approved, so the approval no longer covers it. Nothing was written. "
+        "Re-read the file and retry — that will raise a fresh approval for "
+        "the current contents."
+    )
+
+
+def _write_gate_applies(paths: list[str], task_id: str = "default") -> bool:
+    """Whether any approval gate will look at this request.
+
+    TJS-259 round 7, defect 4: identity (and therefore state hashing) used to
+    be built unconditionally, so every ordinary write hashed every touched
+    path — a measured 1.178 s on a 1 GiB file, and it turned a V4A
+    Delete/Move of a large unprotected file from metadata-bound into a full
+    read. Nothing outside the gates consumes the identity, so it is only
+    computed when a gate exists to consume it.
+
+    Deliberately uses the same predicates the gates themselves use, so the
+    two cannot drift apart on what "gated" means. A drift here is NOT
+    self-correcting: the caller skips both gates entirely when this returns
+    false, so a false negative silently skips approval altogether. (An
+    earlier comment claimed such a case would hand the gate ``identity=None``
+    and fail closed — that was wrong, and the round-8 review was right to
+    call it out.) Any change to either gate's trigger MUST be mirrored here;
+    an exception while deciding therefore answers "gated", the only safe
+    default.
+    """
+    try:
+        enabled, extra = _protected_instruction_config()
+        if enabled and any(
+                _protected_instruction_reason(
+                    p, task_id, enabled=enabled, extra_patterns=extra)
+                for p in paths):
+            return True
+    except Exception:
+        return True  # cannot tell → assume gated (fail safe)
+    try:
+        from agent.file_safety import is_write_approval_required
+        if any(is_write_approval_required(p) for p in paths):
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _redact_diff_text(lines: list[str]) -> str:
+    """Redact a unified diff for display on an approval card.
+
+    TWO passes are required, because the redactor's rules disagree about
+    what a "text" is and neither pass alone is sufficient:
+
+    1. **Per line, marker stripped.** Its config-file rules (``api_key:
+       …``, ``password: …``) are line-anchored, so a leading ``+``/``-``
+       pushes the key off the start of the line and the value survives.
+       Its YAML pass is also gated on ``"://" not in text`` across the
+       WHOLE blob, so one URL anywhere would disable config redaction for
+       every other line. Redacting each line alone fixes both.
+    2. **The assembled blob.** Multiline rules — notably the PEM private
+       key block, which needs its ``BEGIN``/``END`` markers in one string
+       — cannot see across a per-line call, so pass 1 leaves a whole
+       private key in the clear. The blob pass still matches through the
+       ``+`` prefixes, so it recovers those. (Regression: TJS-230.)
+
+    Both run BEFORE truncation: truncating first could cut a PEM's ``END``
+    marker and defeat pass 2.
+
+    ``force=True`` because an approval card is a screenshottable egress
+    boundary that must redact even when the user disabled logging
+    redaction; ``redact_url_credentials=True`` for the same reason. NOT
+    ``file_read``/``code_file`` — those SKIP the ENV/JSON rules, which is
+    precisely backwards here (verified: they re-expose ``api_key:`` values
+    this path must mask).
+    """
+    per_line = []
+    for line in lines:
+        marker, rest = ((line[0], line[1:]) if line[:1] in ("+", "-", " ")
+                        else ("", line))
+        per_line.append(marker + redact_sensitive_text(
+            rest, force=True, redact_url_credentials=True))
+    return redact_sensitive_text(
+        "\n".join(per_line), force=True, redact_url_credentials=True)
+
+
+def _summarize_diff_lines(diff_lines: list[str]) -> str:
+    """``+N/-M lines`` counted from unified-diff body lines."""
+    added = sum(1 for ln in diff_lines
+                if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff_lines
+                  if ln.startswith("-") and not ln.startswith("---"))
+    return f"+{added}/-{removed} lines"
+
+
+class _PreviewFailed:
+    """Sentinel: preview construction RAISED (TJS-258).
+
+    Distinct from ``None``, which means "there is legitimately nothing worth
+    showing" (an empty diff). A raised preview means the card would render a
+    bare ``<write to X>`` placeholder while the user believes they are
+    reviewing a change — the approval they give is then weaker than the one
+    the gate asked for. Gates treat this sentinel as fail-closed.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:  # never mistaken for a usable preview
+        return False
+
+
+PREVIEW_FAILED = _PreviewFailed()
+
+
+def _build_write_preview(
+        paths: list[str], task_id: str = "default", *,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        patch: str | None = None) -> "_WritePreview | _PreviewFailed | None":
+    """Build the diff preview an approval card should display.
+
+    Handles the three shapes the write/patch tools take: a whole-file
+    ``content`` write (diffed against the file on disk), a V4A ``patch``
+    (already a diff — shown as-is), and a replace-mode
+    ``old_string``/``new_string`` edit (diffed as a snippet, since the
+    surrounding file is unchanged).
+
+    Returns ``None`` when there is nothing useful to show (callers fall
+    back to the target-name placeholder), or ``PREVIEW_FAILED`` when
+    construction raised.
+
+    NEVER raises: this runs before a security gate. But it no longer
+    degrades silently either (TJS-258) — a failure is reported as
+    ``PREVIEW_FAILED`` so the gate can block rather than ask the user to
+    approve a change it cannot show them.
+    """
+    try:
+        return _build_write_preview_inner(
+            paths, task_id, content=content, old_string=old_string,
+            new_string=new_string, replace_all=replace_all, patch=patch)
+    except Exception:
+        logger.warning(
+            "Approval-card diff preview failed; the approval gate will fail "
+            "closed rather than show a placeholder", exc_info=True)
+        return PREVIEW_FAILED
+
+
+def _build_write_preview_inner(
+        paths: list[str], task_id: str = "default", *,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        patch: str | None = None) -> "_WritePreview | None":
+    """Preview construction proper. See ``_build_write_preview``."""
+    import difflib
+
+    scope = ""
+    if patch:
+        body = patch.splitlines()
+        label = "V4A patch"
+    elif content is not None and len(paths) == 1:
+        target = paths[0]
+        body = list(difflib.unified_diff(
+            _current_file_text(target, task_id).splitlines(),
+            content.splitlines(),
+            fromfile=f"a/{target}", tofile=f"b/{target}", lineterm=""))
+        label = os.path.basename(target) or target
+    elif old_string is not None and new_string is not None:
+        target = paths[0] if paths else "<file>"
+        body = list(difflib.unified_diff(
+            old_string.splitlines(), new_string.splitlines(),
+            fromfile=f"a/{target}", tofile=f"b/{target}", lineterm=""))
+        label = os.path.basename(target) or target
+        # Snippet-level: the rest of the file is untouched. Under
+        # ``replace_all`` this ONE snippet stands in for every occurrence,
+        # so say how many or the card understates the change.
+        if replace_all:
+            hits = _current_file_text(target, task_id).count(old_string) \
+                if old_string else 0
+            scope = (f", applied to all {hits} occurrences"
+                     if hits != 1 else ", applied to 1 occurrence")
+        else:
+            scope = ", one occurrence (rest of file unchanged)"
+    else:
+        return None
+
+    if not body:
+        return None
+
+    counts = _summarize_diff_lines(body)
+    text = _redact_diff_text(body)
+    truncated = len(text) > _WRITE_PREVIEW_BUDGET
+    if truncated:
+        text = text[:_WRITE_PREVIEW_BUDGET] + "\n... [truncated]"
+    # A diff can legitimately contain ``` (editing a markdown file), which
+    # would close the card's fence early and dump the rest as chat text.
+    text = text.replace("```", "`​`​`")
+
+    summary = f"{counts}{scope}" + (" (preview truncated)" if truncated else "")
+    # Lead with the summary: adapters truncate the fenced block at wildly
+    # different budgets (WhatsApp at 800), so the file name and change size
+    # must come FIRST to be guaranteed to survive.
+    return _WritePreview(diff=f"{label}: {summary}\n{text}", summary=summary)
+
+
+def _write_request_identity(
+        paths: list[str], task_id: str = "default", *,
+        mode: str,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        states: list[str] | None = None,
+        patch: str | None = None) -> str | None:
+    """Canonical identity of the write REQUEST the user is being asked about.
+
+    TJS-258. This is the authorization key for a released "once" grant, and
+    it is built from the *inputs* — never from a preview, a card string or a
+    redacted diff. Every identity defect found in the five TJS-256 review
+    rounds came from keying on a presentation artifact:
+
+    * the card's ``command`` text  → two secrets differing only inside the
+      masked span render identically, so one grant authorized the other;
+    * the redacted diff preview    → same collision, on the protected-write
+      path that motivated the work;
+    * the preview's snippet diff   → ``replace_all=True`` and
+      ``replace_all=False`` produce the SAME diff body, so approving
+      "replace one occurrence" authorized "replace all occurrences"
+      (reproduced end to end through ``patch_tool``).
+
+    The returned string therefore names everything that distinguishes one
+    authorized write from another:
+
+    ``mode``
+        ``write`` / ``replace`` / ``patch``. A whole-file write and an
+        equivalent patch are different decisions and must not share a grant.
+    resolved target path(s) + ``task_id``
+        The real destinations, resolved through the task's base dir, sorted
+        and deduplicated, so the same relative path under a different task
+        is a different request.
+    source state digests (TJS-259 round 6)
+        The current bytes of every path the request touches. A user approves
+        a *change*, not a request in the abstract, and a released grant has
+        no expiry: editing the target (or a V4A Move's source) while the card
+        waits otherwise reproduces the same request identity and redeems the
+        grant against a state that was never shown. Both were reproduced live
+        before this component existed.
+    ``replace_all`` and occurrence scope
+        How many occurrences the approval covers. The count is read from the
+        file the user is deciding about; when it cannot be read the scope is
+        recorded as ``?`` (unknown), which still differs from any number and
+        so still forces a fresh card rather than silently widening.
+    content digests
+        SHA-256 of ``content`` / ``old_string`` / ``new_string`` / ``patch``.
+        Digests, not text: the grant outlives the turn and the raw inputs can
+        hold credentials. The digest is exact for comparison and reveals
+        nothing, and this string never reaches a card payload — it is hashed
+        again by ``_operation_fingerprint`` together with the warning set.
+
+    Returns ``None`` only when the request shape is unrecognizable. Callers
+    MUST fail closed on ``None`` rather than fall back to a weaker key.
+    """
+    def _d(value: str | None) -> str:
+        if value is None:
+            return "-"
+        return hashlib.sha256(
+            value.encode("utf-8", "surrogatepass")).hexdigest()
+
+    if mode not in ("write", "replace", "patch"):
+        return None
+
+    targets = _resolve_write_targets(paths, task_id)
+    if not targets:
+        return None
+    if states is None:
+        states = _capture_path_states(targets, task_id)
+    if any(s == _STATE_UNREADABLE for s in states):
+        # Never build an identity out of an unreadable state: the sentinel is
+        # a stable literal and would MATCH ITSELF, so two different unreadable
+        # states would share a grant (TJS-259 round 7, defect 2). Callers fail
+        # closed on None; `_unverifiable_state_error` gives the user a reason.
+        return None
+
+    # Occurrence scope only means something for a replace.
+    scope = "-"
+    if mode == "replace" and old_string:
+        try:
+            scope = str(_current_file_text(targets[0], task_id).count(old_string))
+        except Exception:
+            scope = "?"
+
+    return "\x1f".join([
+        "hermes.write-request.v2",
+        f"mode={mode}",
+        f"task={task_id}",
+        "targets=" + "\x1e".join(targets),
+        # TJS-259 round 6: the state each touched path is in RIGHT NOW. The
+        # user approved a change against this state; if it moves while the
+        # released card waits, the resumed call must not redeem the grant.
+        # Covers both reproduced defects — the whole-file preimage and the
+        # V4A Move source — because `paths` already carries every endpoint.
+        "states=" + "\x1e".join(states),
+        f"replace_all={bool(replace_all)}",
+        f"occurrences={scope}",
+        f"content={_d(content)}",
+        f"old={_d(old_string)}",
+        f"new={_d(new_string)}",
+        f"patch={_d(patch)}",
+    ])
+
+
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        reasons: list[str], task_id: str = "default",
+        preview: "_WritePreview | _PreviewFailed | None" = None,
+        identity: str | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -849,14 +1350,39 @@ def _request_protected_instruction_approval(
     honors --yolo and session/permanent allowlists, and the entire point
     here is one-operation approval EVERY time, with no persistent scope
     and no yolo bypass. Fail-closed when no human channel exists.
+
+    ``identity`` (TJS-258) is the write-request identity from
+    ``_write_request_identity``. It is REQUIRED on the gateway path: a
+    released "once" grant is keyed on it, so a missing identity would have
+    to fall back to something weaker than the decision the user reviewed.
+    We block instead — see the fail-closed branch below.
     """
     targets = ", ".join(dict.fromkeys(reasons))
+    if isinstance(preview, _PreviewFailed):
+        # TJS-258: the card would show a bare placeholder while the user
+        # believes they are reviewing a change. Do not ask for an approval
+        # weaker than the one this gate needs.
+        logger.error(
+            "Protected-write approval preview failed for %s — blocking "
+            "rather than asking the user to approve a change the card "
+            "cannot show", targets)
+        return (
+            f"BLOCKED: write to protected agent-instruction file(s) "
+            f"({targets}) requires approval but the change could not be "
+            "rendered for review, so it was not shown to the user. Do NOT "
+            "retry it or attempt the same edit via another path."
+        )
     description = (
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )
-    display = f"<write to {targets}>"
+    if preview is not None:
+        description += f" Change: {preview.summary}."
+    # The card renders this in its fenced code block (``_format_exec_approval``
+    # in gateway/platforms/base.py), so putting the diff here surfaces the
+    # actual change on every platform without any adapter-side change.
+    display = preview.diff if preview is not None else f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
@@ -882,6 +1408,24 @@ def _request_protected_instruction_approval(
         notify_cb = None
 
     if notify_cb is not None:
+        # TJS-258: fail closed when the write-request identity is missing.
+        # A released "once" grant is keyed on it; without it the only
+        # available key would be weaker than the decision the user is about
+        # to make (target-only), which is precisely the degradation the
+        # TJS-256 review rounds kept finding. Refusing to raise a card the
+        # answer cannot safely bind to is the conservative outcome.
+        if not identity:
+            logger.error(
+                "Protected-write approval could not build a write-request "
+                "identity for %s — blocking rather than raising a card whose "
+                "'once' answer would bind to a weaker key", targets,
+            )
+            return blocked.format(
+                why="requires approval but the exact write could not be "
+                    "identified, so an approval could not be bound to it.")
+        # NOTE (TJS-256): the released "once" grant for this write is
+        # redeemed centrally inside _await_gateway_decision(). Do not redeem
+        # it here as well — that would consume the grant twice.
         approval_data = {
             "command": display,
             "pattern_key": "protected_instruction_file",
@@ -892,11 +1436,34 @@ def _request_protected_instruction_approval(
         }
         decision = _approval._await_gateway_decision(
             session_key, notify_cb, approval_data, surface="gateway",
+            # TJS-258: identity comes from the write REQUEST (mode, resolved
+            # targets, replace_all, occurrence scope, input digests), never
+            # from `display` — that is the redacted preview, which collides
+            # across different secrets AND across replace_all=True/False.
+            raw_operation=identity,
         )
         if decision.get("notify_failed"):
             return blocked.format(
                 why="requires approval but the approval request could not "
                     "be delivered.")
+        if decision.get("released"):
+            # TJS-226: card is live and unanswered; the agent thread was
+            # released instead of parked. Not a denial — say so precisely,
+            # or the model reports a refusal the user never made.
+            return (
+                f"PENDING APPROVAL: the write to protected agent-instruction "
+                f"file(s) ({targets}) needs the user's approval. The card has "
+                "been sent, does NOT expire, and is still unanswered. Your "
+                "run was released rather than left waiting, and will be "
+                "resumed automatically with the decision whenever the user "
+                "answers — possibly hours from now.\n\n"
+                "Do NOT retry this write and do NOT attempt it via another "
+                "path (terminal, execute_code, patch) — each attempt sends "
+                "another card.\n\n"
+                "You are free to carry on with any OTHER work that does not "
+                "depend on this write. If nothing else is left, end your turn "
+                "and report that approval is pending."
+            )
         choice = decision.get("choice")
         if decision.get("resolved") and choice in {"once", "session", "always"}:
             # One-operation grant regardless of the tapped scope — nothing
@@ -939,8 +1506,10 @@ def _request_protected_instruction_approval(
             "present to approve it.")
 
 
-def _check_protected_instruction_write(paths: list[str],
-                                       task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(
+        paths: list[str], task_id: str = "default",
+        preview: "_WritePreview | _PreviewFailed | None" = None,
+        identity: str | None = None) -> str | None:
     """Gate a write/patch touching protected instruction files.
 
     Returns ``None`` when no target is protected or the human approved;
@@ -949,6 +1518,9 @@ def _check_protected_instruction_write(paths: list[str],
     protected target, and a deny applies nothing (including innocent
     files) — partial application of an approved-in-part patch would be
     more surprising than an atomic all-or-nothing outcome.
+
+    ``identity`` (TJS-258) is the write-request identity a released "once"
+    answer is bound to; see ``_write_request_identity``.
     """
     enabled, extra = _protected_instruction_config()
     if not enabled:
@@ -961,11 +1533,14 @@ def _check_protected_instruction_write(paths: list[str],
             reasons.append(reason)
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(
+        reasons, task_id, preview, identity)
 
 
-def _check_approval_required_write(paths: list[str],
-                                   task_id: str = "default") -> str | None:
+def _check_approval_required_write(
+        paths: list[str], task_id: str = "default",
+        preview: "_WritePreview | _PreviewFailed | None" = None,
+        identity: str | None = None) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config``).
 
     These paths are NOT credentials and NOT hard-denied, but a write must
@@ -990,11 +1565,25 @@ def _check_approval_required_write(paths: list[str],
         return None
 
     display_targets = ", ".join(dict.fromkeys(targets))
+    if isinstance(preview, _PreviewFailed):
+        # TJS-258: same rule as the protected-write gate.
+        logger.error(
+            "SSH-config write approval preview failed for %s — blocking "
+            "rather than asking the user to approve an unshown change",
+            display_targets)
+        return (
+            f"BLOCKED: write to SSH config file(s) ({display_targets}) "
+            "requires approval but the change could not be rendered for "
+            "review, so it was not shown to the user. Do NOT retry it via "
+            "another path."
+        )
     description = (
         f"Write to SSH client config file(s): {display_targets}. "
         "The SSH config can carry ProxyCommand / Match exec directives that "
         "run commands, so writes require your approval."
     )
+    if preview is not None:
+        description += f" Change: {preview.summary}."
     blocked = (
         f"BLOCKED: write to SSH config file(s) ({display_targets}) "
         "{why} Do NOT retry it via another path (terminal, execute_code) "
@@ -1010,7 +1599,14 @@ def _check_approval_required_write(paths: list[str],
     result = _approval._run_approval_gate(
         pattern_key="ssh_config_write",
         description=description,
-        display_target=f"<write to {display_targets}>",
+        display_target=(preview.diff if preview is not None
+                        else f"<write to {display_targets}>"),
+        # TJS-258: same rule as the protected-write gate — a released "once"
+        # grant binds to the write REQUEST, not to the displayed preview.
+        # ``None`` makes the gate fail closed rather than fall back to the
+        # (redacted, colliding) display string.
+        raw_operation=identity,
+        require_raw_operation=True,
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
         single_query_deny_message=blocked.format(
@@ -2248,12 +2844,35 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
-    protected_err = _check_protected_instruction_write([path], task_id)
-    if protected_err:
-        return tool_error(protected_err)
-    approval_err = _check_approval_required_write([path], task_id)
-    if approval_err:
-        return tool_error(approval_err)
+    # TJS-259 round 7 defect 4: only pay for the preview + state hashing when
+    # a gate actually exists to consume them. An ungated write used to hash
+    # every touched path (1.178s on a 1 GiB file).
+    _gated = _write_gate_applies([path], task_id)
+    _approved_targets: list[str] = []
+    _approved_states: list[str] = []
+    if _gated:
+        # Built once and shared by both gates so the approval card shows the
+        # actual change rather than only the target's name. PRESENTATION ONLY.
+        _preview = _build_write_preview([path], task_id, content=content)
+        # TJS-258: authorization identity, built from the REQUEST — independent
+        # of the preview, so a preview failure cannot weaken it.
+        _approved_targets = _resolve_write_targets([path], task_id)
+        _approved_states = _capture_path_states(_approved_targets, task_id)
+        _unverifiable = _unverifiable_state_error(
+            _approved_targets, _approved_states)
+        if _unverifiable:
+            return tool_error(_unverifiable)
+        _identity = _write_request_identity(
+            [path], task_id, mode="write", content=content,
+            states=_approved_states)
+        protected_err = _check_protected_instruction_write(
+            [path], task_id, _preview, _identity)
+        if protected_err:
+            return tool_error(protected_err)
+        approval_err = _check_approval_required_write(
+            [path], task_id, _preview, _identity)
+        if approval_err:
+            return tool_error(approval_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -2289,6 +2908,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # TJS-259 round 7 defect 3: the gate decided BEFORE this lock, so
+            # a concurrent subagent could have changed the file in between.
+            # The lock exists to serialize exactly those writers, so the
+            # authorized state is re-verified here, inside it, and the write
+            # is abandoned on any difference.
+            if _approved_targets:
+                _drift = _state_drift_error(
+                    _approved_targets, _approved_states, task_id)
+                if _drift:
+                    return tool_error(_drift)
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -2397,25 +3026,69 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
             return tool_error(binary_doc_err)
+    # TJS-259 round 8 defect 1: ONE immutable resolved-path plan, built here
+    # and used for authorization, locking and mutation alike. Resolving the
+    # raw paths again after the locks were held made the written path a
+    # different file from the reviewed and locked one: retarget a symlinked
+    # AGENTS.md while the card waits, and the code locked/revalidated the
+    # original target while the later re-resolution rewrote the V4A header to
+    # the new one — the unreviewed file was written with no fresh card.
+    # Resolving once removes the second resolution that could disagree.
+    _path_to_resolved: dict[str, str | None] = {}
+    for _p in _paths_to_check:
+        try:
+            _path_to_resolved[_p] = str(_resolve_path_for_task(_p, task_id))
+        except Exception:
+            _path_to_resolved[_p] = None
+
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
-    protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
-    if protected_err:
-        return tool_error(protected_err)
-    approval_err = _check_approval_required_write(_paths_to_check, task_id)
-    if approval_err:
-        return tool_error(approval_err)
+    # TJS-259 round 7 defect 4: skipped entirely when no gate applies, so an
+    # ordinary V4A Delete/Move of a large file stays metadata-bound.
+    _gated = _write_gate_applies(_paths_to_check, task_id)
+    _approved_targets: list[str] = []
+    _approved_states: list[str] = []
+    if _gated:
+        _preview = _build_write_preview(
+            _paths_to_check, task_id,
+            old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
+            patch=patch if mode == "patch" else None)
+        # TJS-258: identity from the REQUEST. ``replace_all`` and the occurrence
+        # count are part of it — the snippet diff is identical for
+        # replace_all=True and False, so a preview-derived key let a
+        # one-occurrence approval authorize rewriting every occurrence.
+        _approved_targets = _resolve_write_targets(
+            _paths_to_check, task_id, plan=_path_to_resolved)
+        _approved_states = _capture_path_states(_approved_targets, task_id)
+        _unverifiable = _unverifiable_state_error(
+            _approved_targets, _approved_states)
+        if _unverifiable:
+            return tool_error(_unverifiable)
+        _identity = _write_request_identity(
+            _paths_to_check, task_id,
+            mode="patch" if mode == "patch" else "replace",
+            old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
+            states=_approved_states,
+            patch=patch if mode == "patch" else None)
+        protected_err = _check_protected_instruction_write(
+            _paths_to_check, task_id, _preview, _identity)
+        if protected_err:
+            return tool_error(protected_err)
+        approval_err = _check_approval_required_write(
+            _paths_to_check, task_id, _preview, _identity)
+        if approval_err:
+            return tool_error(approval_err)
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
-        # multi-file V4A patches.
+        # Lock ordering comes from the SAME plan built above — never a fresh
+        # resolution (TJS-259 round 8 defect 1). Ordered + deduplicated so
+        # concurrent callers lock in the same order, preventing deadlock on
+        # overlapping multi-file V4A patches.
         _resolved_paths: list[str] = []
         _seen: set[str] = set()
         for _p in _paths_to_check:
-            try:
-                _r = str(_resolve_path_for_task(_p, task_id))
-            except Exception:
-                _r = None
+            _r = _path_to_resolved.get(_p)
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
                 _seen.add(_r)
@@ -2429,16 +3102,23 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
 
+            # TJS-259 round 7 defect 3: re-verify the authorized state now
+            # that every path is locked. The gate ran before these locks, so
+            # a concurrent subagent could have moved the file underneath the
+            # decision. All-or-nothing, matching the gate's own semantics.
+            if _approved_targets:
+                _drift = _state_drift_error(
+                    _approved_targets, _approved_states, task_id)
+                if _drift:
+                    return tool_error(_drift)
+
             # Collect warnings — cross-agent registry first (names sibling),
-            # then per-task tracker as a fallback.
+            # then per-task tracker as a fallback. Uses the ONE plan; the
+            # second resolution that used to happen here is what let the
+            # written path drift away from the reviewed and locked one.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
+                _r = _path_to_resolved.get(_p)
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:
