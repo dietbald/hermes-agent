@@ -199,6 +199,19 @@ _BUILTIN_ENV_CLASS_BACKENDS = {
     "VercelSandboxEnvironment": "vercel_sandbox",
 }
 
+#: Backend-image override keys mapped to the backend they name. A task may
+#: declare its backend by image key instead of ``env_type``, and that names a
+#: remote backend just as surely (TJS-259 round 19). Must cover every key in
+#: ``terminal_tool._ISOLATION_OVERRIDE_KEYS`` except ``env_type`` itself,
+#: which is read directly — a new isolation key missing from here would
+#: silently leave path resolution on host semantics. Pinned by a test.
+_OVERRIDE_IMAGE_KEY_BACKENDS = {
+    "docker_image": "docker",
+    "modal_image": "modal",
+    "singularity_image": "singularity",
+    "daytona_image": "daytona",
+}
+
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
@@ -242,8 +255,36 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return builtin
             # Anything else is a plugin object that cannot identify itself.
             # The configured backend is what the factory built it from, so
-            # it is the authoritative answer — falling through to it below
-            # is deliberate, not an accident of control flow.
+            # it is the authoritative answer — falling through is deliberate.
+
+        # No live environment (or an unidentifiable plugin one). A registered
+        # override declares the backend BEFORE ``_get_file_ops`` lazily
+        # creates the object, so it is the only evidence that exists in that
+        # window (TJS-259 round 19). Round 15 taught the approval classifier
+        # this; the sibling never learned it, so path resolution used HOST
+        # semantics — and dereferenced host symlinks — for a task whose
+        # backend is a container.
+        #
+        # ``resolve_task_overrides`` is the canonical reader (raw id first,
+        # then collapsed container id), the same one the terminal layer uses
+        # to decide what to build, so the two cannot disagree.
+        try:
+            from tools.terminal_tool import (
+                resolve_task_overrides,
+            )
+            overrides = resolve_task_overrides(task_id) or {}
+        except Exception:
+            overrides = {}
+        declared = overrides.get("env_type")
+        if isinstance(declared, str) and declared.strip():
+            return declared.strip().lower()
+        # A backend-image override names a remote backend just as surely as
+        # env_type does; a cwd-only override is a workspace hint and must not
+        # change path semantics. Map the image key to its backend.
+        for _key, _backend in _OVERRIDE_IMAGE_KEY_BACKENDS.items():
+            if overrides.get(_key):
+                return _backend
+
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:

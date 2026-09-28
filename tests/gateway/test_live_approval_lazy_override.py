@@ -224,3 +224,146 @@ def test_host_symlink_to_protected_is_still_gated(tmp_path):
         assert gw.call(write_file_tool, path=str(link), content="x\n").released
         assert gw.card_count == 1
     assert protected.read_text() == "protected\n"
+
+
+# ── Round 19: path resolution in the lazy-override window ──────────────
+
+
+@pytest.mark.parametrize("overrides", [
+    {"env_type": "docker"},
+    {"docker_image": "python:3.11"},
+    {"modal_image": "python:3.11"},
+])
+def test_path_resolution_honours_a_registered_override(
+        register_override, monkeypatch, overrides):
+    """A declared remote backend must drive path semantics too.
+
+    Round 15 taught ``_backend_shares_the_host_filesystem`` that a registered
+    override exists BEFORE the environment object is lazily created. The
+    sibling ``_terminal_env_type_for_task`` never learned it, so in that same
+    window path resolution used HOST semantics for a task whose backend is a
+    container.
+    """
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", overrides)
+
+    import tools.terminal_tool as TT
+    with TT._env_lock:
+        assert TT._active_environments.get("default") is None
+
+    assert FT._uses_container_paths("default") is True, (
+        f"override {overrides} declared a container backend but path "
+        "resolution used host semantics")
+
+
+def test_host_symlinks_are_not_dereferenced_during_the_lazy_window(
+        register_override, monkeypatch, tmp_path):
+    """The behavioural regression: the RESOLVED PATH, not the classification.
+
+    ``_resolve_path_for_task`` dereferenced a HOST symlink while the task's
+    backend is Docker, so the requested path was rewritten in the wrong
+    filesystem namespace before the gated write ever obtained its backend.
+    The container namespace is not the host's — a host symlink there means
+    nothing and must not be followed.
+    """
+    host_target = tmp_path / "host_target.md"
+    host_target.write_text("host side\n")
+    link = tmp_path / "notes.md"
+    link.symlink_to(host_target)
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {"env_type": "docker"})
+
+    resolved = str(FT._resolve_path_for_task(str(link), "default"))
+
+    assert resolved != str(host_target), (
+        "a host symlink was dereferenced to its host target while the task's "
+        f"backend is Docker — the path was rewritten in the wrong filesystem "
+        f"namespace (got {resolved})")
+
+
+def test_local_task_still_resolves_host_symlinks(monkeypatch, tmp_path):
+    """Fail-open guard: a genuinely local task keeps host path semantics."""
+    host_target = tmp_path / "host_target.md"
+    host_target.write_text("host side\n")
+    link = tmp_path / "notes.md"
+    link.symlink_to(host_target)
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    assert FT._uses_container_paths("default") is False
+    assert FT._resolve_path_for_task(str(link), "default")
+
+
+def test_a_cwd_only_override_does_not_change_path_semantics(
+        register_override, monkeypatch):
+    """A workspace hint is not a backend declaration, here either."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {"cwd": "/tmp/somewhere"})
+
+    assert FT._uses_container_paths("default") is False
+
+
+def test_an_explicit_local_override_keeps_host_path_semantics(
+        register_override, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {"env_type": "local"})
+
+    assert FT._uses_container_paths("default") is False
+
+
+def test_a_live_environment_still_wins_over_the_override(
+        register_override, monkeypatch):
+    """Once the object exists it is the ground truth, not the declaration.
+
+    The override says what was ASKED for; a live environment is what was
+    BUILT. If they disagree, the built one is performing the operations.
+    """
+    import tools.terminal_tool as TT
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {"env_type": "docker"})
+    env = type("LocalEnvironment", (), {"cwd": "/tmp"})()
+    with TT._env_lock:
+        TT._active_environments["default"] = env
+    try:
+        assert FT._terminal_env_type_for_task("default") == "local"
+    finally:
+        with TT._env_lock:
+            TT._active_environments.pop("default", None)
+        FT.clear_file_ops_cache("default")
+
+
+def test_every_isolation_override_key_maps_to_a_backend():
+    """A new isolation key must not silently leave paths on host semantics.
+
+    ``_ISOLATION_OVERRIDE_KEYS`` is the terminal layer's own list of keys
+    that declare a remote backend. Every one except ``env_type`` (read
+    directly) must appear in the image-key map, or a task declaring its
+    backend that way gets host path resolution.
+
+    Behavioural, not structural: each mapping is exercised through
+    ``_uses_container_paths`` so a present-but-wrong value fails too — the
+    round-18 lesson.
+    """
+    from tools.terminal_tool import _ISOLATION_OVERRIDE_KEYS, _is_container_backend
+
+    expected = set(_ISOLATION_OVERRIDE_KEYS) - {"env_type"}
+    missing = expected - set(FT._OVERRIDE_IMAGE_KEY_BACKENDS)
+    assert not missing, (
+        f"isolation override keys with no backend mapping: {sorted(missing)}")
+
+    for key, backend in FT._OVERRIDE_IMAGE_KEY_BACKENDS.items():
+        assert _is_container_backend(backend), (
+            f"{key} maps to {backend!r}, which is not a container backend")
+
+
+@pytest.mark.parametrize("key", ["docker_image", "modal_image",
+                                 "singularity_image", "daytona_image"])
+def test_each_image_override_key_forces_container_paths(
+        register_override, monkeypatch, key):
+    """Each mapping proven by behaviour, not by reading the table."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {key: "some-image"})
+
+    assert FT._uses_container_paths("default") is True, key
