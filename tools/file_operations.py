@@ -1946,16 +1946,26 @@ class ShellFileOperations(FileOperations):
 
         Streamed in fixed chunks on the backend, so peak memory is the chunk
         size on both sides no matter how large the file is; only the hex
-        digest crosses the boundary. ``[ -f ]``-equivalent guarding comes from
-        opening in binary and letting a non-regular/unreadable path raise —
-        both report the sentinel, which maps to ``None`` (fail closed) rather
-        than to a digest.
+        digest crosses the boundary.
+
+        The regular-file check is an explicit ``stat`` BEFORE the open, not a
+        consequence of it (TJS-259 round 9, defect 2). "Let ``open()`` raise
+        on a non-regular path" is false for a FIFO: opening one for reading
+        blocks until a writer appears, so a gated ``AGENTS.md`` that is a FIFO
+        stranded the tool thread forever instead of failing closed. ``stat``
+        (not ``lstat``) so a symlink to a regular file still digests its
+        target — rejecting symlinks would block ordinary approved writes.
+        Everything that is not a regular file reports the sentinel, which maps
+        to ``None`` and therefore to "unreadable" in the caller.
         """
         target = self._expand_path(path)
         snippet = (
-            "import hashlib, sys\n"
+            "import hashlib, os, stat, sys\n"
             f"p = {target!r}\n"
             "try:\n"
+            "    st = os.stat(p)\n"
+            "    if not stat.S_ISREG(st.st_mode):\n"
+            "        raise OSError('not a regular file')\n"
             "    h = hashlib.sha256()\n"
             "    with open(p, 'rb') as fh:\n"
             "        while True:\n"

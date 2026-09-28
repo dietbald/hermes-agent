@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import posixpath
+import stat as stat_module
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -876,15 +877,35 @@ def _current_file_text(filepath: str, task_id: str = "default") -> str:
     Used only to build an approval preview, so every failure (missing file,
     permissions, binary bytes) degrades to "treat as empty / new file"
     rather than blocking the gate.
+
+    Non-regular paths are rejected BEFORE any blocking read (TJS-259 round 9,
+    defect 2). ``Path.read_text()`` on a FIFO blocks until a writer appears —
+    it never raises — so a gated ``AGENTS.md`` that is a FIFO stranded the
+    tool thread here, one step earlier than the state digest. Opened with
+    ``O_NONBLOCK`` and type-checked via ``fstat`` on the descriptor rather
+    than ``stat``-then-open, so there is no window in which the path could
+    change type between the check and the read.
     """
     try:
         resolved = Path(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError, RuntimeError):
         resolved = Path(_expand_tilde(filepath))
+    fd = None
     try:
-        return resolved.read_text(encoding="utf-8", errors="replace")
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            fd = None  # ownership transferred to the file object
+            return fh.read()
     except (OSError, ValueError):
         return ""
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 #: Sentinel for a path whose current state could not be read. It is NOT a
@@ -2844,6 +2865,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
+    # ONE immutable resolved-path plan, built before anything reads or
+    # decides (TJS-259 round 9, defect 1). Round 8 gave patch_tool this shape
+    # but left write_file resolving twice: once for the authorization identity
+    # and again after both gates, then locking, drift-checking and writing
+    # THAT second result. Retarget a symlinked AGENTS.md in between and the
+    # reviewed file was untouched while an unreviewed one was overwritten, on
+    # the original card. Resolution happens here and nowhere else in this
+    # function; authorization, locking, drift, mutation and the reported path
+    # all read this plan.
+    try:
+        _resolved = str(_resolve_path_for_task(path, task_id))
+    except Exception:
+        _resolved = None
+    _plan: dict[str, str | None] = {path: _resolved}
+
     # TJS-259 round 7 defect 4: only pay for the preview + state hashing when
     # a gate actually exists to consume them. An ungated write used to hash
     # every touched path (1.178s on a 1 GiB file).
@@ -2856,7 +2892,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         _preview = _build_write_preview([path], task_id, content=content)
         # TJS-258: authorization identity, built from the REQUEST — independent
         # of the preview, so a preview failure cannot weaken it.
-        _approved_targets = _resolve_write_targets([path], task_id)
+        _approved_targets = _resolve_write_targets([path], task_id, plan=_plan)
         _approved_states = _capture_path_states(_approved_targets, task_id)
         _unverifiable = _unverifiable_state_error(
             _approved_targets, _approved_states)
@@ -2884,15 +2920,22 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "file contents before writing."
         )
     try:
-        # Resolve once for the registry lock + stale check.  Failures here
-        # fall back to the legacy path — write proceeds, per-task staleness
+        # No resolution here: ``_resolved`` comes from the ONE plan built
+        # above, before the gates ran. A failure to resolve there falls back
+        # to the legacy path — the write proceeds and the per-task staleness
         # check below still runs.
-        try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
-        except Exception:
-            _resolved = None
-
         if _resolved is None:
+            if _gated:
+                # A gated write whose target could not be resolved has no
+                # plan to authorize, lock or write against, and the legacy
+                # fallback below hands the RAW path to the backend, which
+                # resolves it again itself — exactly the second resolution
+                # this round removes. Fail closed instead (round 9).
+                return tool_error(
+                    f"BLOCKED: could not resolve '{path}' to a single target, "
+                    "so an approval cannot be bound to the file that would be "
+                    "written. Use an absolute path and retry."
+                )
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
@@ -3046,6 +3089,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     # TJS-259 round 7 defect 4: skipped entirely when no gate applies, so an
     # ordinary V4A Delete/Move of a large file stays metadata-bound.
     _gated = _write_gate_applies(_paths_to_check, task_id)
+    if _gated:
+        # Same fail-closed rule as write_file (round 9): an unresolvable path
+        # in a gated request has no plan to authorize or lock, and both the
+        # replace target and the V4A header rewrite fall back to the RAW path,
+        # which the backend then resolves for itself — a second resolution by
+        # another name.
+        _unplanned = [_p for _p, _r in _path_to_resolved.items() if not _r]
+        if _unplanned:
+            return tool_error(
+                f"BLOCKED: could not resolve {', '.join(_unplanned)} to a "
+                "single target, so an approval cannot be bound to the file(s) "
+                "that would be written. Use absolute paths and retry."
+            )
     _approved_targets: list[str] = []
     _approved_states: list[str] = []
     if _gated:
