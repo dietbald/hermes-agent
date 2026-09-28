@@ -1948,26 +1948,29 @@ class ShellFileOperations(FileOperations):
         size on both sides no matter how large the file is; only the hex
         digest crosses the boundary.
 
-        The regular-file check is an explicit ``stat`` BEFORE the open, not a
-        consequence of it (TJS-259 round 9, defect 2). "Let ``open()`` raise
-        on a non-regular path" is false for a FIFO: opening one for reading
-        blocks until a writer appears, so a gated ``AGENTS.md`` that is a FIFO
-        stranded the tool thread forever instead of failing closed. ``stat``
-        (not ``lstat``) so a symlink to a regular file still digests its
-        target — rejecting symlinks would block ordinary approved writes.
-        Everything that is not a regular file reports the sentinel, which maps
-        to ``None`` and therefore to "unreadable" in the caller.
+        Opened ONCE, non-blocking, and type-checked on the descriptor
+        (TJS-259 round 11). Round 9 used ``os.stat`` and then a separate
+        ``open``, which is a check-then-open race: retarget a symlink from a
+        regular file to a FIFO between the two syscalls and ``open`` still
+        blocks forever. ``O_NONBLOCK`` makes the open itself return on a
+        FIFO, and ``fstat`` then answers about the descriptor actually held,
+        so there is no window in which the path can change type. Anything not
+        a regular file reports the sentinel, which maps to ``None`` and
+        therefore to "unreadable" in the caller. ``O_RDONLY`` follows
+        symlinks, so a symlink to a regular file still digests its target.
         """
         target = self._expand_path(path)
         snippet = (
             "import hashlib, os, stat, sys\n"
             f"p = {target!r}\n"
+            "fd = -1\n"
             "try:\n"
-            "    st = os.stat(p)\n"
-            "    if not stat.S_ISREG(st.st_mode):\n"
+            "    fd = os.open(p, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))\n"
+            "    if not stat.S_ISREG(os.fstat(fd).st_mode):\n"
             "        raise OSError('not a regular file')\n"
             "    h = hashlib.sha256()\n"
-            "    with open(p, 'rb') as fh:\n"
+            "    with os.fdopen(fd, 'rb') as fh:\n"
+            "        fd = -1\n"
             "        while True:\n"
             "            b = fh.read(1048576)\n"
             "            if not b:\n"
@@ -1976,6 +1979,12 @@ class ShellFileOperations(FileOperations):
             "    print(h.hexdigest())\n"
             "except Exception:\n"
             f"    print({self._DIGEST_UNREADABLE!r})\n"
+            "finally:\n"
+            "    if fd >= 0:\n"
+            "        try:\n"
+            "            os.close(fd)\n"
+            "        except OSError:\n"
+            "            pass\n"
         )
         try:
             result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")

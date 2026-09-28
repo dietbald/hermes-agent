@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import posixpath
-import stat as stat_module
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -882,41 +881,75 @@ class _WritePreview(NamedTuple):
     summary: str
 
 
+class _PreimageUnavailable(Exception):
+    """The reviewed preimage could not be read from the task backend.
+
+    Raised rather than returned so it cannot be mistaken for "the file is
+    empty". ``_build_write_preview`` converts it to ``PREVIEW_FAILED``, which
+    both gates already treat as "block, do not raise a card" (TJS-258).
+    """
+
+
 def _current_file_text(filepath: str, task_id: str = "default") -> str:
-    """Best-effort read of a file's current text; ``""`` when unreadable.
+    """The file's current text, read through the TASK FILE BACKEND.
 
-    Used only to build an approval preview, so every failure (missing file,
-    permissions, binary bytes) degrades to "treat as empty / new file"
-    rather than blocking the gate.
+    Used to build the approval card's preimage — the "before" side of the
+    diff the user is asked to approve.
 
-    Non-regular paths are rejected BEFORE any blocking read (TJS-259 round 9,
-    defect 2). ``Path.read_text()`` on a FIFO blocks until a writer appears —
-    it never raises — so a gated ``AGENTS.md`` that is a FIFO stranded the
-    tool thread here, one step earlier than the state digest. Opened with
-    ``O_NONBLOCK`` and type-checked via ``fstat`` on the descriptor rather
-    than ``stat``-then-open, so there is no window in which the path could
-    change type between the check and the read.
+    Read through ``_get_file_ops(task_id)``, the same object that performs
+    the write and that the authorization identity already hashes (TJS-259
+    round 11). This previously read the HOST filesystem with ``Path`` while
+    identity and mutation went through the backend. Under a container or SSH
+    backend those are different filesystems: a target absent on the host but
+    present on the backend rendered as a brand-new file (``+1/-0``) with the
+    remote contents the write was about to destroy omitted entirely. The user
+    then approved a change that was not the one performed.
+
+    Three outcomes, deliberately distinct:
+
+    text
+        The backend's current contents.
+    ``""``
+        The path does not exist on the backend — a genuine creation, which is
+        an honest thing to show as ``+n/-0``.
+    :class:`_PreimageUnavailable`
+        The backend could not answer. NOT empty: falling back to ``""`` is
+        exactly how an overwrite gets presented as a creation, so this fails
+        closed instead.
     """
     try:
-        resolved = Path(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError, RuntimeError):
-        resolved = Path(_expand_tilde(filepath))
-    fd = None
+        ops = _get_file_ops(task_id)
+    except Exception as exc:
+        raise _PreimageUnavailable(str(filepath)) from exc
+
+    # Non-regular paths (FIFO, device, directory) have no reviewable text and
+    # must never be opened here — ``read_file_raw`` guards the blocking read
+    # with a stat-only probe, so this stays bounded (round 9/10).
     try:
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+        result = ops.read_file_raw(filepath)
+    except Exception as exc:
+        raise _PreimageUnavailable(str(filepath)) from exc
+
+    if getattr(result, "error", None):
+        # Distinguish "missing" from "unreadable" through the backend's own
+        # existence probe rather than by parsing the error text — the shell
+        # backend reports both as "File not found" on the read path, which is
+        # the ambiguity that produced round 7's defect 2.
+        try:
+            exists = ops.path_exists(filepath)
+        except Exception:
+            exists = None
+        if exists is False:
             return ""
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
-            fd = None  # ownership transferred to the file object
-            return fh.read()
-    except (OSError, ValueError):
-        return ""
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        raise _PreimageUnavailable(str(filepath))
+
+    content = getattr(result, "content", None)
+    if content is None:
+        # A binary/image read returns no content and no error. There is no
+        # text to review, and the write tools already refuse binary targets
+        # separately, so treat it as unreviewable rather than empty.
+        raise _PreimageUnavailable(str(filepath))
+    return content
 
 
 #: Sentinel for a path whose current state could not be read. It is NOT a
@@ -1378,7 +1411,12 @@ def _write_request_identity(
         try:
             scope = str(_current_file_text(targets[0], task_id).count(old_string))
         except Exception:
-            scope = "?"
+            # Was "?" — a stable literal, so two requests against two
+            # different unreadable preimages shared one identity. That is
+            # round 7's defect 2 in a second place. No preimage means no
+            # occurrence count, which means no honest identity: fail closed
+            # exactly as an unreadable state does.
+            return None
 
     return "\x1f".join([
         "hermes.write-request.v2",
