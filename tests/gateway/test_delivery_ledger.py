@@ -47,7 +47,8 @@ def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
             """SELECT state, attempts, owner_pid, content, last_error,
-                      retryable, failure_count, next_attempt_at, cancelled_at
+                      retryable, failure_count, next_attempt_at, cancelled_at,
+                      last_alert_at
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
@@ -61,6 +62,7 @@ def _row(oid):
         "failure_count": r[6],
         "next_attempt_at": r[7],
         "cancelled_at": r[8],
+        "last_alert_at": r[9],
     }
 
 
@@ -101,6 +103,14 @@ def _orphan(oid):
         )
 
 
+def _make_due(oid, when=0):
+    with dl._connect() as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET next_attempt_at=? WHERE obligation_id=?",
+            (when, oid),
+        )
+
+
 class TestSchemaMigration:
     def test_adds_adapter_profile_to_existing_ledger(self):
         conn = sqlite3.connect(dl._db_path())
@@ -129,7 +139,14 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
-        assert "adapter_profile" in columns
+        assert {
+            "adapter_profile",
+            "retryable",
+            "failure_count",
+            "next_attempt_at",
+            "cancelled_at",
+            "last_alert_at",
+        }.issubset(columns)
 
 
 class TestStateMachine:
@@ -173,6 +190,7 @@ class TestRuntimeFailedSweep:
     def test_claims_current_process_send_path_degraded_row(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
+        _make_due("ob-1")
 
         claimed = dl.sweep_failed_for_runtime("telegram")
 
@@ -199,6 +217,8 @@ class TestRuntimeFailedSweep:
             chat_id="C2",
         )
         dl.mark_failed("ob-2", "send_path_degraded")
+        _make_due("ob-1")
+        _make_due("ob-2")
 
         claimed = dl.sweep_failed_for_runtime("telegram")
 
@@ -274,6 +294,8 @@ class TestRuntimeFailedSweep:
             adapter_profile="reviewer",
         )
         dl.mark_failed("ob-2", "send_path_degraded")
+        _make_due("ob-1")
+        _make_due("ob-2")
 
         claimed = dl.sweep_failed_for_runtime("telegram", profile="reviewer")
 
@@ -289,6 +311,7 @@ class TestRuntimeFailedSweep:
                 "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
                 (dl.MAX_ATTEMPTS, "ob-1"),
             )
+        _make_due("ob-1")
 
         claimed = dl.sweep_failed_for_runtime("telegram")
         assert [row["obligation_id"] for row in claimed] == ["ob-1"]
@@ -304,6 +327,7 @@ class TestRuntimeFailedSweep:
         """
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
+        _make_due("ob-1")
 
         # First reconnect legitimately claims and (successfully) redelivers.
         assert len(dl.sweep_failed_for_runtime("telegram")) == 1
@@ -332,6 +356,7 @@ class TestRuntimeFailedSweep:
                 "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
                 (now - dl.STALE_AFTER_SECONDS - 1, "ob-1"),
             )
+        _make_due("ob-1")
 
         claimed = dl.sweep_failed_for_runtime("telegram", now=now)
         assert [row["obligation_id"] for row in claimed] == ["ob-1"]
@@ -356,6 +381,75 @@ class TestRuntimeFailedSweep:
         assert row["state"] == "cancelled"
         assert row["cancelled_at"] is not None
         assert dl.sweep_failed_for_runtime("telegram", now=before + 999) == []
+
+    def test_send_path_degraded_uses_real_backoff(self):
+        _record(platform="telegram")
+        before = time.time()
+
+        dl.mark_failed("ob-1", "send_path_degraded")
+
+        row = _row("ob-1")
+        assert row["next_attempt_at"] >= before + dl._RETRY_BACKOFF_SECONDS[0]
+        assert dl.sweep_failed_for_runtime(
+            "telegram", now=row["next_attempt_at"] - 0.01
+        ) == []
+
+    def test_dead_owner_retryable_row_is_adopted_when_due(self):
+        _record(platform="telegram")
+        dl.mark_failed("ob-1", "TimedOut: sendMessage read timed out")
+        due = _row("ob-1")["next_attempt_at"]
+        _orphan("ob-1")
+
+        assert dl.sweep_failed_for_runtime("telegram", now=due - 0.01) == []
+        claimed = dl.sweep_failed_for_runtime("telegram", now=due + 0.01)
+
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+        assert _row("ob-1")["owner_pid"] == os.getpid()
+
+    def test_legacy_send_path_row_keeps_historical_poison_bound(self):
+        _record(platform="telegram")
+        now = time.time()
+        with dl._connect() as conn:
+            conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='failed', retryable=0, last_error='send_path_degraded',
+                       attempts=?, created_at=?, next_attempt_at=NULL
+                   WHERE obligation_id=?""",
+                (dl.MAX_ATTEMPTS, now - dl.STALE_AFTER_SECONDS - 1, "ob-1"),
+            )
+
+        assert dl.sweep_failed_for_runtime("telegram", now=now) == []
+        assert _row("ob-1")["state"] == "abandoned"
+
+    def test_cancelled_attempt_cannot_be_marked_delivered_or_resurrected(self):
+        _record(platform="telegram")
+        dl.mark_failed("ob-1", "TimedOut: sendMessage read timed out")
+        _make_due("ob-1")
+        assert len(dl.sweep_failed_for_runtime("telegram")) == 1
+        assert dl.cancel_obligation("ob-1") is True
+
+        dl.mark_delivered("ob-1")
+        _record(platform="telegram")
+
+        row = _row("ob-1")
+        assert row["state"] == "cancelled"
+        assert row["cancelled_at"] is not None
+
+    def test_alert_file_repeats_after_interval(self):
+        _record(platform="telegram")
+        for _ in range(dl.ALERT_AFTER_FAILURES):
+            dl.mark_failed("ob-1", "429 Too Many Requests")
+        alert_path = dl.get_hermes_home() / "logs" / "delivery_alerts.jsonl"
+        assert len(alert_path.read_text(encoding="utf-8").splitlines()) == 1
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET last_alert_at=? WHERE obligation_id=?",
+                (time.time() - dl.ALERT_REPEAT_SECONDS - 1, "ob-1"),
+            )
+
+        dl.mark_failed("ob-1", "429 Too Many Requests")
+
+        assert len(alert_path.read_text(encoding="utf-8").splitlines()) == 2
 
     def test_alert_file_is_written_once_at_threshold(self, tmp_path):
         _record(platform="telegram")
@@ -383,6 +477,35 @@ class TestPrune:
             )
         dl._prune()
         assert _row("ob-1") is None
+
+    def test_large_active_backlog_is_retained_and_alerted(self, monkeypatch):
+        now = time.time()
+        with dl._connect() as conn:
+            conn.executemany(
+                """INSERT INTO delivery_obligations
+                   (obligation_id, session_key, platform, chat_id, content,
+                    state, attempts, created_at, updated_at, adapter_profile,
+                    retryable)
+                   VALUES (?, 's', 'telegram', 'c', 'owed', 'failed', 0, ?, ?,
+                           'default', 1)""",
+                [
+                    (f"bulk-{index}", now, now)
+                    for index in range(dl.BACKLOG_ALERT_ROWS + 1)
+                ],
+            )
+        alert = MagicMock()
+        monkeypatch.setattr(dl, "_surface_backlog_alert", alert)
+        monkeypatch.setattr(dl, "_last_backlog_alert_at", 0.0)
+
+        dl._prune(now=now)
+
+        with dl._connect() as conn:
+            active = conn.execute(
+                """SELECT COUNT(*) FROM delivery_obligations
+                   WHERE state IN ('pending', 'attempting', 'failed')"""
+            ).fetchone()[0]
+        assert active == dl.BACKLOG_ALERT_ROWS + 1
+        alert.assert_called_once_with(active, now)
 
 
 class TestLedgerEnabled:
@@ -519,6 +642,7 @@ class TestGatewayRedeliverySweep:
             "TimedOut: sendMessage read timed out",
             retry_after=0,
         )
+        _make_due("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
 
@@ -536,6 +660,7 @@ class TestGatewayRedeliverySweep:
 
         _record(platform="slack")
         dl.mark_failed("ob-1", "send_path_degraded")
+        _make_due("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
 
@@ -561,6 +686,7 @@ class TestGatewayRedeliverySweep:
             adapter_profile="reviewer",
         )
         dl.mark_failed("ob-1", "send_path_degraded")
+        _make_due("ob-1")
         default_adapter = self._adapter()
         reviewer_adapter = self._adapter()
         runner = self._runner(default_adapter)
@@ -582,6 +708,7 @@ class TestGatewayRedeliverySweep:
 
         _record(platform="slack")
         dl.mark_failed("ob-1", "send_path_degraded")
+        _make_due("ob-1")
         runner = self._runner()
 
         n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
@@ -597,6 +724,7 @@ class TestGatewayRedeliverySweep:
 
         _record(platform="slack")
         dl.mark_failed("ob-1", "send_path_degraded")
+        _make_due("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
         runner._async_session_store.clear_resume_pending.side_effect = RuntimeError(

@@ -142,7 +142,7 @@ def _recent_journal_counts(profile: str, minutes: int) -> dict[str, int]:
 def _ledger_counts(profile_dir: Path) -> dict[str, int | str]:
     db = profile_dir / "state.db"
     if not db.exists():
-        return {"status": "missing", "retryable_failed": 0, "cancelled": 0}
+        return {"status": "missing", "active_undelivered": 0, "retryable_failed": 0, "cancelled": 0}
     try:
         uri = f"file:{urllib.parse.quote(str(db))}?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=2) as conn:
@@ -150,7 +150,7 @@ def _ledger_counts(profile_dir: Path) -> dict[str, int | str]:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_obligations'"
             ).fetchone()
             if not tables:
-                return {"status": "no_table", "retryable_failed": 0, "cancelled": 0}
+                return {"status": "no_table", "active_undelivered": 0, "retryable_failed": 0, "cancelled": 0}
             columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
             }
@@ -163,14 +163,20 @@ def _ledger_counts(profile_dir: Path) -> dict[str, int | str]:
             cancelled = conn.execute(
                 "SELECT count(*) FROM delivery_obligations WHERE state='cancelled'"
             ).fetchone()[0] if "cancelled_at" in columns else 0
+            active_undelivered = conn.execute(
+                """SELECT count(*) FROM delivery_obligations
+                   WHERE state IN ('pending', 'attempting', 'failed')"""
+            ).fetchone()[0]
             return {
                 "status": "ok",
+                "active_undelivered": int(active_undelivered),
                 "retryable_failed": int(retryable_failed),
                 "cancelled": int(cancelled),
             }
     except Exception as exc:
         return {
             "status": f"error:{exc.__class__.__name__}",
+            "active_undelivered": 0,
             "retryable_failed": 0,
             "cancelled": 0,
         }

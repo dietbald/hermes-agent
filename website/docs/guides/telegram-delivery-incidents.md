@@ -8,13 +8,15 @@ Final agent replies are written to `state.db` before the first platform send. Tr
 
 An ambiguous timeout can mean Telegram received the message but its acknowledgement was lost. Retried replies therefore carry the recovered-reply marker and may be duplicates; this is deliberate at-least-once delivery.
 
-After three failures Hermes emits an ERROR-level `DELIVERY NEEDS ATTENTION` journal entry and appends a token-free record to:
+After three failures Hermes emits an ERROR-level `DELIVERY NEEDS ATTENTION` journal entry and appends a token-free record to the path below. It repeats the alert at most once per hour while failures continue, so a long incident does not disappear after a one-shot warning.
 
 ```text
 $HERMES_HOME/logs/delivery_alerts.jsonl
 ```
 
 This is the visible, Telegram-independent alert path. A host monitor should alert on either a new line in that file or a non-zero health-probe exit. Do not route that alert only through Telegram.
+
+The 500-row housekeeping cap applies to terminal (`delivered`, `abandoned`, `cancelled`) rows only. Active obligations are intentionally never deleted merely to enforce a size cap: deleting one would violate the delivery-until-cancelled contract. When active obligations exceed 500, Hermes emits a repeating `DELIVERY BACKLOG NEEDS ATTENTION` journal/file alert, and the health probe reports `ledger.active_undelivered`. The operator must restore delivery or explicitly cancel unwanted obligations; disk growth is visible rather than silently converted into lost replies.
 
 ## Inspect or cancel obligations
 
@@ -24,6 +26,7 @@ These commands do not print response content:
 cd /home/tj/hermes/hermes-agent
 .venv/bin/python scripts/delivery-obligations.py --profile atlas list
 .venv/bin/python scripts/delivery-obligations.py --profile atlas cancel <obligation_id>
+.venv/bin/python scripts/delivery-obligations.py --profile default list
 ```
 
 Cancellation is explicit and terminal. Use it only when the reply is no longer wanted or repeated delivery would be harmful.

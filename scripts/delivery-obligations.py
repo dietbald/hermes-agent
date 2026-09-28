@@ -17,6 +17,10 @@ from pathlib import Path
 
 
 def _home(profile: str) -> Path:
+    # The default Hermes profile lives directly under ~/.hermes; named
+    # profiles live under ~/.hermes/profiles/<slug>.
+    if profile == "default":
+        return Path.home() / ".hermes"
     return Path.home() / ".hermes" / "profiles" / profile
 
 
