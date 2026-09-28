@@ -179,13 +179,22 @@ _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal",
 #: so ``LocalisedCloudSandboxEnvironment`` contains "local" while being a
 #: remote sandbox (TJS-259 round 17). Plugin objects that cannot be stamped
 #: are NOT in here by design — they fall back to the configured backend.
+#:
+#: Every VALUE must be a backend ``_is_container_backend`` recognises, because
+#: that predicate decides whether paths are mapped into the container. Round
+#: 18: ``ManagedModalEnvironment`` was mapped to ``managed_modal``, which is
+#: NOT in ``_CONTAINER_BACKENDS``, so a gateway-owned Modal sandbox got host
+#: path semantics. It maps to ``modal`` — the ``env_type`` it is built from
+#: (``_create_environment(env_type="modal")`` returns it when the managed
+#: backend is selected) and a real remote sandbox either way. A table whose
+#: keys are complete but whose values are wrong is no safer than no table.
 _BUILTIN_ENV_CLASS_BACKENDS = {
     "LocalEnvironment": "local",
     "SSHEnvironment": "ssh",
     "DockerEnvironment": "docker",
     "SingularityEnvironment": "singularity",
     "ModalEnvironment": "modal",
-    "ManagedModalEnvironment": "managed_modal",
+    "ManagedModalEnvironment": "modal",
     "DaytonaEnvironment": "daytona",
     "VercelSandboxEnvironment": "vercel_sandbox",
 }

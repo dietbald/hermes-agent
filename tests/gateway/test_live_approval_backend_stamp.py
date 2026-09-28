@@ -417,3 +417,90 @@ def test_every_builtin_env_class_in_the_tree_is_mapped():
     assert not missing, (
         f"built-in environment classes not mapped in "
         f"_BUILTIN_ENV_CLASS_BACKENDS: {sorted(missing)}")
+
+
+# ── Round 18: the table's VALUES must be semantically right ────────────
+
+
+def test_managed_modal_class_gets_container_path_semantics(
+        install_env, monkeypatch):
+    """A gateway-owned Modal sandbox is a container, whatever it is called.
+
+    ``_create_environment(env_type="modal")`` returns a
+    ``ManagedModalEnvironment`` when the managed backend is selected, and the
+    built-in path does not stamp it. Round 17's table mapped that class to
+    ``managed_modal``, which ``_is_container_backend`` reports False for, so
+    the three path-resolution callers applied HOST semantics to a remote
+    Modal sandbox.
+    """
+    monkeypatch.setenv("TERMINAL_ENV", "modal")
+    env = type("ManagedModalEnvironment", (), {"cwd": "/workspace"})()
+    install_env("default", env)
+
+    assert FT._uses_container_paths("default") is True, (
+        "a gateway-owned Modal sandbox was given host path semantics")
+
+
+@pytest.mark.parametrize("cls_name,expect_container", [
+    ("LocalEnvironment", False),
+    ("SSHEnvironment", False),
+    ("DockerEnvironment", True),
+    ("SingularityEnvironment", True),
+    ("ModalEnvironment", True),
+    ("ManagedModalEnvironment", True),
+    ("DaytonaEnvironment", True),
+    ("VercelSandboxEnvironment", True),
+])
+def test_every_builtin_class_routes_paths_correctly(
+        install_env, monkeypatch, cls_name, expect_container):
+    """Semantic regression over the whole table.
+
+    The class-discovery grep proves every built-in is PRESENT in the table;
+    it cannot prove the VALUES are right. This asserts the thing that
+    actually matters — which filesystem each class's paths are resolved
+    against — for every entry.
+    """
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    env = type(cls_name, (), {"cwd": "/workspace"})()
+    install_env("default", env)
+
+    assert FT._uses_container_paths("default") is expect_container, cls_name
+
+
+def test_every_mapped_backend_is_a_known_backend():
+    """Each table VALUE must be a backend the terminal layer recognises.
+
+    A typo or an invented backend name would silently answer "not a
+    container", which is the round-18 defect in general form.
+    """
+    from tools.terminal_tool import _CONTAINER_BACKENDS, _is_container_backend
+
+    known = set(_CONTAINER_BACKENDS) | {"local", "ssh"}
+    for cls, backend in FT._BUILTIN_ENV_CLASS_BACKENDS.items():
+        assert backend in known, (
+            f"{cls} maps to {backend!r}, which the terminal layer does not "
+            f"know as a backend; _is_container_backend says "
+            f"{_is_container_backend(backend)}")
+
+
+def test_only_local_is_a_host_filesystem_backend():
+    """Non-container does NOT imply host filesystem.
+
+    ``ssh`` is not a container backend — its paths are not mapped into a
+    sandbox namespace — but its filesystem is emphatically not the agent's.
+    Deriving the host-filesystem set from "not a container" would be the
+    round-18 mistake with the opposite sign, so the two questions stay
+    separate and this pins it.
+    """
+    from tools.terminal_tool import _is_container_backend
+
+    for cls, backend in FT._BUILTIN_ENV_CLASS_BACKENDS.items():
+        host = cls in FT._HOST_FILESYSTEM_ENV_CLASSES
+        if host:
+            assert backend == "local", (
+                f"{cls} is treated as the host filesystem but maps to "
+                f"{backend!r}")
+        if not _is_container_backend(backend) and backend != "local":
+            assert not host, (
+                f"{cls} ({backend}) is not a container but is also not the "
+                "host; it must not take the host fast path")
