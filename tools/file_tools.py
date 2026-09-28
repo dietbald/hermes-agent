@@ -1128,12 +1128,20 @@ def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
     is NOT (docker/ssh/modal/...), only the backend can answer and the host's
     view is actively wrong (TJS-259 round 12).
 
-    Two independent signals must BOTH say "local" (round 14). The global
-    config alone missed a task-scoped Docker environment; the task
-    environment alone would let a stale local entry override a
-    Docker-configured session. Either one saying non-local wins, because the
-    cost of being wrong that way is a subprocess and the cost of being wrong
-    the other way is an unapproved write to a protected file.
+    Three signals, and ALL of them must say "local" (round 15). Each covers a
+    window the others miss:
+
+    1. The global configuration.
+    2. The env overrides REGISTERED for this task. These declare the backend
+       before ``_get_file_ops`` lazily creates the environment object, so in
+       that window the registry is the only evidence that exists — trusting
+       the global config there let host realpath clear a write that the
+       remote backend, created moments later, then performed.
+    3. The environment object actually bound to this task, once it exists.
+
+    Any one saying non-local wins, because the cost of being wrong that way
+    is a subprocess and the cost of being wrong the other way is an
+    unapproved write to a protected file.
 
     Fails CLOSED in every ambiguous case (round 13): an unreadable config, a
     missing config key, an unrecognised backend and an unclassifiable task
@@ -1155,8 +1163,34 @@ def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
             not in _HOST_FILESYSTEM_BACKENDS:
         return False
 
-    # Signal 2 — the environment actually bound to THIS TASK, which is what
-    # performs the write. A task override is invisible to the global config.
+    # Signal 2 — overrides REGISTERED for this task, which exist before the
+    # environment object does. ``resolve_task_overrides`` is the canonical
+    # reader (raw id first, then collapsed container id); using it keeps this
+    # gate from drifting away from what the terminal layer will actually
+    # build.
+    try:
+        from tools.terminal_tool import (
+            _ISOLATION_OVERRIDE_KEYS, resolve_task_overrides,
+        )
+        overrides = resolve_task_overrides(task_id) or {}
+    except Exception:
+        return False
+    declared = overrides.get(_ENV_TYPE_KEY)
+    if declared is not None:
+        if str(declared).strip().lower() not in _HOST_FILESYSTEM_BACKENDS:
+            return False
+    elif set(overrides) & set(_ISOLATION_OVERRIDE_KEYS):
+        # A backend-image override (docker_image/modal_image/...) names a
+        # remote backend just as surely as env_type does. A cwd-only override
+        # is a workspace hint, not a backend declaration, and deliberately
+        # does NOT force the slow path.
+        logger.warning(
+            "task %r registered backend-image overrides %s; treating the file "
+            "backend as non-local so approval gating resolves through it",
+            task_id, sorted(set(overrides) & set(_ISOLATION_OVERRIDE_KEYS)))
+        return False
+
+    # Signal 3 — the environment actually bound to THIS TASK, once created.
     try:
         from tools.terminal_tool import (
             _active_environments, _env_lock, _resolve_container_task_id,
@@ -1171,7 +1205,9 @@ def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
     except Exception:
         return False
     if env is None:
-        return True  # no task override: the global answer stands
+        # No environment yet AND no remote override declared above: the
+        # global answer stands.
+        return True
     name = env.__class__.__name__.lower()
     if "local" in name:
         return True

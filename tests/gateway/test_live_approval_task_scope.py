@@ -71,8 +71,13 @@ def install_task_environment(request):
 
     installed: list[str] = []
 
-    def _install(task_id, env):
-        TT.register_task_env_overrides(task_id, {"env_type": "docker"})
+    def _install(task_id, env, env_type="docker"):
+        # The override is what makes ``_resolve_container_task_id`` keep this
+        # task id distinct instead of collapsing it to "default", so it has to
+        # be registered — and it must DECLARE THE SAME BACKEND as the
+        # environment object, or the fixture is asserting two different
+        # things at once.
+        TT.register_task_env_overrides(task_id, {"env_type": env_type})
         FT.clear_file_ops_cache(task_id)
         with TT._env_lock:
             TT._active_environments[task_id] = env
@@ -85,7 +90,11 @@ def install_task_environment(request):
             TT._active_environments.pop(task_id, None)
         FT.clear_file_ops_cache(task_id)
         try:
-            TT.register_task_env_overrides(task_id, {})
+            # ``register_task_env_overrides(task_id, {})`` leaves an empty
+            # dict behind, which still reads as "registered". Clear it
+            # properly or the docker declaration leaks into every later test
+            # on the same task id.
+            TT.clear_task_env_overrides(task_id)
         except Exception:
             pass
 
@@ -162,8 +171,8 @@ def test_task_scoped_local_still_uses_the_fast_path(install_task_environment, mo
     from tools.environments.local import LocalEnvironment
 
     monkeypatch.setenv("TERMINAL_ENV", "local")
-    install_task_environment(TASK,
-                              LocalEnvironment(cwd=str(tmp_path)))
+    install_task_environment(TASK, LocalEnvironment(cwd=str(tmp_path)),
+                             env_type="local")
 
     assert FT._backend_shares_the_host_filesystem(TASK) is True
 
