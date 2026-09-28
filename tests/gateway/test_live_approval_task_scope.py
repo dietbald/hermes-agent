@@ -40,12 +40,16 @@ TASK = "tjs259-round14-task"
 class _FakeDockerEnvironment:
     """Stands in for a task-scoped DockerEnvironment entry.
 
-    Classification is by class name, which is how ``_terminal_env_type_for_task``
-    already identifies backends.
+    Carries the ``_hermes_backend_name`` stamp the provider factory applies,
+    because that is what a real environment object presents to path
+    resolution (TJS-259 round 17). It previously relied on class-name
+    substring sniffing, which was itself the round-16/17 defect — a fake that
+    depends on the bug is not evidence of anything.
     """
 
     def __init__(self, cwd="/workspace"):
         self.cwd = cwd
+        self._hermes_backend_name = "docker"
 
     def execute(self, command, cwd=None, **kwargs):  # pragma: no cover
         raise AssertionError("the fake backend must not be executed")

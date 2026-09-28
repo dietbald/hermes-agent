@@ -173,6 +173,23 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
+#: Built-in environment classes mapped to their backend type, by EXACT class
+#: name. Used only when an environment carries no ``_hermes_backend_name``
+#: stamp. Exact identity, never a substring: plugin class names are arbitrary,
+#: so ``LocalisedCloudSandboxEnvironment`` contains "local" while being a
+#: remote sandbox (TJS-259 round 17). Plugin objects that cannot be stamped
+#: are NOT in here by design — they fall back to the configured backend.
+_BUILTIN_ENV_CLASS_BACKENDS = {
+    "LocalEnvironment": "local",
+    "SSHEnvironment": "ssh",
+    "DockerEnvironment": "docker",
+    "SingularityEnvironment": "singularity",
+    "ModalEnvironment": "modal",
+    "ManagedModalEnvironment": "managed_modal",
+    "DaytonaEnvironment": "daytona",
+    "VercelSandboxEnvironment": "vercel_sandbox",
+}
+
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
@@ -201,21 +218,23 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             stamped = getattr(env, "_hermes_backend_name", None)
             if isinstance(stamped, str) and stamped.strip():
                 return stamped.strip().lower()
-            # Unstamped: the built-in classes do follow these names, so the
-            # substring match stays as the fallback for them.
-            name = env.__class__.__name__.lower()
-            if "local" in name:
-                return "local"
-            if "ssh" in name:
-                return "ssh"
-            if "docker" in name:
-                return "docker"
-            if "singularity" in name:
-                return "singularity"
-            if "modal" in name:
-                return "modal"
-            if "daytona" in name:
-                return "daytona"
+            # Unstamped. The factory stamps inside
+            # ``try/except AttributeError: pass``, so an object using
+            # ``__slots__`` or a read-only ``__setattr__`` reaches here with
+            # no stamp at all — a documented, supported case (round 17).
+            #
+            # Only the BUILT-IN classes may be identified by name, and by
+            # EXACT identity: a plugin's class name is arbitrary, so
+            # substring matching let ``LocalisedCloudSandboxEnvironment``
+            # pass for the host and applied host path semantics to a remote
+            # plugin namespace.
+            builtin = _BUILTIN_ENV_CLASS_BACKENDS.get(env.__class__.__name__)
+            if builtin:
+                return builtin
+            # Anything else is a plugin object that cannot identify itself.
+            # The configured backend is what the factory built it from, so
+            # it is the authoritative answer — falling through to it below
+            # is deliberate, not an accident of control flow.
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
@@ -1125,10 +1144,13 @@ _HOST_FILESYSTEM_BACKENDS = frozenset({"local"})
 
 #: Built-in environment classes whose filesystem IS the host's, matched by
 #: EXACT class name. Only consulted when an environment carries no
-#: ``_hermes_backend_name`` stamp. Exact identity, never a substring: a
-#: plugin class called ``LocalisedSandboxEnvironment`` contains "local" and
-#: is not the host at all (TJS-259 round 16).
-_HOST_FILESYSTEM_ENV_CLASSES = frozenset({"LocalEnvironment"})
+#: ``_hermes_backend_name`` stamp. Derived from the single
+#: ``_BUILTIN_ENV_CLASS_BACKENDS`` table so this gate and path resolution
+#: cannot disagree about what a class name means (TJS-259 rounds 16-17).
+_HOST_FILESYSTEM_ENV_CLASSES = frozenset(
+    cls for cls, backend in _BUILTIN_ENV_CLASS_BACKENDS.items()
+    if backend in _HOST_FILESYSTEM_BACKENDS
+)
 
 #: Key ``_get_env_config`` reports the backend type under. Asserted against
 #: the real config at import-time-ish in the tests, because reading a key

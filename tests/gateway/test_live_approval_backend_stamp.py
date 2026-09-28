@@ -264,3 +264,156 @@ def test_unstamped_built_ins_still_classify_by_name(install_env, monkeypatch):
     install_env("default", env)
 
     assert FT._terminal_env_type_for_task("default") == "docker"
+
+
+# ── Round 17: the factory's documented AttributeError path ─────────────
+
+
+class UnstampableEnvironment:
+    """A duck-typed plugin object that REJECTS the backend stamp.
+
+    ``tools/terminal_tool.py`` stamps ``_hermes_backend_name`` inside
+    ``try: ... except AttributeError: pass`` — so an object using
+    ``__slots__`` or a read-only ``__setattr__`` is a documented, supported
+    case that reaches path resolution carrying no stamp at all. Its class
+    name is then the only thing left to look at, and a plugin's class name
+    is arbitrary.
+    """
+
+    __slots__ = ("cwd",)
+
+    def __init__(self):
+        self.cwd = "/workspace"
+
+    def execute(self, command, cwd=None, **kwargs):  # pragma: no cover
+        raise AssertionError("the fake backend must not be executed")
+
+
+class LocalisedCloudSandboxEnvironment(UnstampableEnvironment):
+    """Unstampable AND local-sounding: the reviewer's exact reproduction.
+
+    ``__slots__ = ()`` is required: a subclass that omits it re-adds
+    ``__dict__`` and becomes stampable again, which would silently make this
+    whole reproduction vacuous.
+    """
+
+    __slots__ = ()
+
+
+def test_the_factory_really_cannot_stamp_this_object():
+    """Pin the premise: the stamp genuinely fails, as the factory allows."""
+    env = LocalisedCloudSandboxEnvironment()
+    with pytest.raises(AttributeError):
+        env._hermes_backend_name = "my-cloud-sandbox"
+    assert getattr(env, "_hermes_backend_name", None) is None
+
+
+def test_an_unstampable_plugin_is_not_classified_local(
+        install_env, monkeypatch):
+    """The configured backend decides when the object cannot be asked.
+
+    Global config names the plugin ``my-cloud-sandbox``; the live object
+    cannot carry a stamp and its class name contains "local". Under the
+    defect the substring won and path resolution applied HOST semantics to a
+    remote plugin namespace.
+    """
+    monkeypatch.setenv("TERMINAL_ENV", "my-cloud-sandbox")
+    install_env("default", LocalisedCloudSandboxEnvironment())
+
+    assert FT._terminal_env_type_for_task("default") == "my-cloud-sandbox", (
+        "an unstampable plugin object was classified by its arbitrary class "
+        "name instead of the configured backend identity")
+
+
+def test_an_unstampable_plugin_uses_container_paths(
+        install_env, monkeypatch):
+    """And the container-path decision must follow that classification."""
+    monkeypatch.setenv("TERMINAL_ENV", "my-cloud-sandbox")
+    install_env("default", LocalisedCloudSandboxEnvironment())
+
+    monkeypatch.setattr(
+        "tools.terminal_tool._plugin_env_flag",
+        lambda env_type, flag: env_type == "my-cloud-sandbox" and flag == "is_container")
+
+    assert FT._uses_container_paths("default") is True, (
+        "host path semantics were applied to a remote plugin namespace")
+
+
+def test_an_unstampable_object_under_local_config_stays_local(
+        install_env, monkeypatch):
+    """Fail-open guard: a genuinely local session must not go remote.
+
+    Falling back to the configured identity has to mean the CONFIG decides,
+    not "assume remote" — otherwise every local session with an unusual
+    environment object pays container path mapping it does not need.
+    """
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    install_env("default", UnstampableEnvironment())
+
+    assert FT._terminal_env_type_for_task("default") == "local"
+    assert FT._uses_container_paths("default") is False
+
+
+def test_unstamped_built_ins_are_matched_by_exact_identity(
+        install_env, monkeypatch):
+    """Built-in classes keep working, by exact name rather than substring."""
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    for cls_name, expected in [
+        ("DockerEnvironment", "docker"),
+        ("SSHEnvironment", "ssh"),
+        ("ModalEnvironment", "modal"),
+        ("DaytonaEnvironment", "daytona"),
+        ("SingularityEnvironment", "singularity"),
+        ("LocalEnvironment", "local"),
+    ]:
+        env = type(cls_name, (), {"cwd": "/workspace"})()
+        install_env("default", env)
+        assert FT._terminal_env_type_for_task("default") == expected, cls_name
+
+
+def test_an_unstamped_local_sounding_plugin_class_is_not_local(
+        install_env, monkeypatch):
+    """The substring hole, in the path-resolution helper."""
+    monkeypatch.setenv("TERMINAL_ENV", "my-cloud-sandbox")
+    env = type("LocalisedSandboxEnvironment", (), {"cwd": "/workspace"})()
+    install_env("default", env)
+
+    assert FT._terminal_env_type_for_task("default") != "local"
+
+
+def test_the_two_class_tables_cannot_drift():
+    """The gate and path resolution must agree on what a class name means.
+
+    ``_HOST_FILESYSTEM_ENV_CLASSES`` is derived from
+    ``_BUILTIN_ENV_CLASS_BACKENDS`` rather than written out twice, because two
+    hand-maintained lists of the same fact is how rounds 12-17 kept happening.
+    """
+    for cls, backend in FT._BUILTIN_ENV_CLASS_BACKENDS.items():
+        assert (cls in FT._HOST_FILESYSTEM_ENV_CLASSES) == (
+            backend in FT._HOST_FILESYSTEM_BACKENDS), cls
+
+
+def test_every_builtin_env_class_in_the_tree_is_mapped():
+    """A new built-in environment class must be added to the table.
+
+    An unmapped built-in falls back to the configured backend, which is safe
+    but silently wrong when the two disagree. Catching it here is cheaper
+    than another review round.
+    """
+    import pathlib
+    import re
+
+    env_dir = pathlib.Path(FT.__file__).parent / "environments"
+    declared = set()
+    for path in env_dir.glob("*.py"):
+        for m in re.finditer(r"^class (\w+Environment)\(", path.read_text(),
+                             re.MULTILINE):
+            declared.add(m.group(1))
+    # Abstract bases and error types are not concrete backends.
+    declared -= {"BaseEnvironment", "BaseModalExecutionEnvironment"}
+
+    missing = declared - set(FT._BUILTIN_ENV_CLASS_BACKENDS)
+    assert not missing, (
+        f"built-in environment classes not mapped in "
+        f"_BUILTIN_ENV_CLASS_BACKENDS: {sorted(missing)}")
