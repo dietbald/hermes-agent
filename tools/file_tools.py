@@ -291,7 +291,32 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
 
 
+def _uses_host_paths_for_backend(env_type: str | None) -> bool:
+    """Whether *env_type*'s paths may be resolved with HOST semantics.
+
+    ONLY ``local``. This is deliberately not the negation of
+    "is a container" (TJS-259 round 20): SSH is not a container backend —
+    its paths are not mapped into a sandbox namespace — but its filesystem
+    is emphatically not the agent's either. Treating "not a container" as
+    "is the host" made ``_resolve_path_for_task`` dereference a HOST symlink
+    for an SSH task, rewriting the path in the wrong filesystem namespace
+    before the remote ``FileOperations`` could resolve it.
+
+    Unknown and empty identities answer False: a backend nobody recognises
+    must not be handed the host's symlink graph. The cost of being wrong that
+    way is a path left unresolved for the backend to resolve itself, which is
+    what a remote backend wants anyway.
+    """
+    return str(env_type or "").strip().lower() in _HOST_FILESYSTEM_BACKENDS
+
+
 def _uses_container_paths(task_id: str = "default") -> bool:
+    """Whether this task's paths live in a container namespace.
+
+    Answers "is it a container", NOT "is it remote" — see
+    :func:`_uses_host_paths_for_backend` for the distinction. Callers
+    deciding whether HOST resolution is permissible must ask that one.
+    """
     env_type = _terminal_env_type_for_task(task_id)
     try:
         from tools.terminal_tool import _is_container_backend
@@ -299,6 +324,11 @@ def _uses_container_paths(task_id: str = "default") -> bool:
         return _is_container_backend(env_type)
     except Exception:
         return env_type in _CONTAINER_PATH_BACKENDS_FALLBACK
+
+
+def _uses_host_paths(task_id: str = "default") -> bool:
+    """Whether this task's paths may be resolved with HOST semantics."""
+    return _uses_host_paths_for_backend(_terminal_env_type_for_task(task_id))
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -421,7 +451,10 @@ def _resolve_base_dir(
     """
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
-        container_paths = _uses_container_paths(task_id)
+        # "Not host" rather than "is container" (TJS-259 round 20): SSH and
+        # unknown backends are remote without being containers, and must not
+        # get host resolution.
+        container_paths = not _uses_host_paths(task_id)
     if root:
         base_text = _expand_tilde(root)
     else:
@@ -460,7 +493,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     translated to ``C:\\Users\\...`` before resolution so file tools don't
     treat them as relative ``\\c\\Users\\...`` under the process cwd.
     """
-    container_paths = _uses_container_paths(task_id)
+    container_paths = not _uses_host_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
@@ -508,7 +541,7 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         workspace_root = _authoritative_workspace_root(task_id)
         if not workspace_root:
             return None  # No authoritative workspace root to compare against.
-        if _uses_container_paths(task_id):
+        if not _uses_host_paths(task_id):
             root = _normalize_without_host_deref(Path(_expand_tilde(workspace_root)))
         else:
             root = Path(_expand_tilde(workspace_root)).resolve()

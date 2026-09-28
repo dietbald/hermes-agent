@@ -37,7 +37,12 @@ def install_env():
     def _install(task_id, env):
         with TT._env_lock:
             existing = TT._active_environments.pop(task_id, None)
-        if existing is not None:
+        # Record the ORIGINAL only. Installing twice on the same task (a
+        # loop over class names) would otherwise record one of our own fakes
+        # as "what was there", and teardown would restore THAT — leaking a
+        # fake environment into every later test in the session. That leak
+        # produced four spurious failures before it was found (TJS-259 r20).
+        if task_id not in evicted:
             evicted[task_id] = existing
         FT.clear_file_ops_cache(task_id)
         with TT._env_lock:
@@ -55,6 +60,8 @@ def install_env():
         except Exception:
             pass
     for task_id, env in evicted.items():
+        if env is None:
+            continue
         with TT._env_lock:
             TT._active_environments[task_id] = env
 
@@ -441,30 +448,58 @@ def test_managed_modal_class_gets_container_path_semantics(
         "a gateway-owned Modal sandbox was given host path semantics")
 
 
-@pytest.mark.parametrize("cls_name,expect_container", [
-    ("LocalEnvironment", False),
-    ("SSHEnvironment", False),
-    ("DockerEnvironment", True),
-    ("SingularityEnvironment", True),
-    ("ModalEnvironment", True),
-    ("ManagedModalEnvironment", True),
-    ("DaytonaEnvironment", True),
-    ("VercelSandboxEnvironment", True),
+@pytest.mark.parametrize("cls_name,expect_container,expect_host", [
+    ("LocalEnvironment", False, True),
+    # SSH is the standing counter-example: NOT a container, and NOT the
+    # host either. "not a container" is not "is the host" (TJS-259 r20).
+    ("SSHEnvironment", False, False),
+    ("DockerEnvironment", True, False),
+    ("SingularityEnvironment", True, False),
+    ("ModalEnvironment", True, False),
+    ("ManagedModalEnvironment", True, False),
+    ("DaytonaEnvironment", True, False),
+    ("VercelSandboxEnvironment", True, False),
 ])
 def test_every_builtin_class_routes_paths_correctly(
-        install_env, monkeypatch, cls_name, expect_container):
+        install_env, monkeypatch, cls_name, expect_container, expect_host):
     """Semantic regression over the whole table.
 
     The class-discovery grep proves every built-in is PRESENT in the table;
     it cannot prove the VALUES are right. This asserts the thing that
     actually matters — which filesystem each class's paths are resolved
     against — for every entry.
+
+    Two separate questions, because conflating them WAS the round-20 defect:
+    ``_uses_container_paths`` ("are paths in a sandbox namespace?") and
+    ``_uses_host_paths`` ("may host resolution be used?"). Only the second
+    decides whether a host symlink is dereferenced, and only ``local`` may
+    answer it True.
     """
     monkeypatch.setenv("TERMINAL_ENV", "local")
     env = type(cls_name, (), {"cwd": "/workspace"})()
     install_env("default", env)
 
     assert FT._uses_container_paths("default") is expect_container, cls_name
+    assert FT._uses_host_paths("default") is expect_host, cls_name
+
+
+def test_host_path_semantics_are_narrower_than_non_container():
+    """No built-in may be both non-container and host EXCEPT local.
+
+    Pins the distinction itself, so a future entry cannot quietly inherit
+    host resolution by being classified "not a container".
+    """
+    from tools.terminal_tool import _is_container_backend
+
+    for cls_name, backend in FT._BUILTIN_ENV_CLASS_BACKENDS.items():
+        if FT._uses_host_paths_for_backend(backend):
+            assert backend == "local", (
+                f"{cls_name} -> {backend!r} would use HOST path resolution; "
+                "only 'local' may")
+        if not _is_container_backend(backend) and backend != "local":
+            assert not FT._uses_host_paths_for_backend(backend), (
+                f"{cls_name} -> {backend!r} is neither a container nor local, "
+                "so it must not get host path semantics")
 
 
 def test_every_mapped_backend_is_a_known_backend():

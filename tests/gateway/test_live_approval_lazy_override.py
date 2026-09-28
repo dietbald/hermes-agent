@@ -59,6 +59,35 @@ def register_override():
             TT._active_environments[task_id] = env
 
 
+@pytest.fixture
+def no_live_environment():
+    """Evict any lazily-created environment for a task, and restore it.
+
+    Several tests here resolve paths, which lazily CREATES and caches a
+    ``LocalEnvironment`` on ``"default"``. A later test asserting global
+    SSH behaviour would then read that live object and correctly answer
+    "local" — testing the precedence rule instead of the thing it claims
+    to test. This is test scaffolding, not a product behaviour.
+    """
+    import tools.terminal_tool as TT
+
+    evicted: dict[str, object] = {}
+
+    def _clear(task_id: str = "default"):
+        with TT._env_lock:
+            existing = TT._active_environments.pop(task_id, None)
+        if existing is not None:
+            evicted[task_id] = existing
+        FT.clear_file_ops_cache(task_id)
+
+    yield _clear
+
+    for task_id, env in evicted.items():
+        with TT._env_lock:
+            TT._active_environments[task_id] = env
+        FT.clear_file_ops_cache(task_id)
+
+
 # ── The lazy-creation window ───────────────────────────────────────────
 
 
@@ -367,3 +396,86 @@ def test_each_image_override_key_forces_container_paths(
     register_override("default", {key: "some-image"})
 
     assert FT._uses_container_paths("default") is True, key
+
+
+# ── Round 20: remote-but-not-a-container (SSH) ─────────────────────────
+
+
+def _host_symlink(tmp_path):
+    target = tmp_path / "host_target.md"
+    target.write_text("host side\n")
+    link = tmp_path / "notes.md"
+    link.symlink_to(target)
+    return target, link
+
+
+def test_global_ssh_does_not_dereference_host_symlinks(no_live_environment, monkeypatch, tmp_path):
+    """SSH is remote but not a container; it must not use host resolution.
+
+    ``_uses_container_paths`` asks ``_is_container_backend``, which is False
+    for SSH, and the callers then fall through to host ``Path.resolve()``.
+    The remote filesystem is not the host's, so a host symlink there means
+    nothing and must not be followed before SSH ``FileOperations`` resolves
+    it remotely.
+    """
+    target, link = _host_symlink(tmp_path)
+    no_live_environment("default")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+
+    resolved = str(FT._resolve_path_for_task(str(link), "default"))
+
+    assert resolved != str(target), (
+        "an SSH task dereferenced a host symlink to its host target "
+        f"(got {resolved})")
+
+
+def test_ssh_task_override_does_not_dereference_host_symlinks(
+        register_override, monkeypatch, tmp_path):
+    """Same through the lazy-override window."""
+    target, link = _host_symlink(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {"env_type": "ssh"})
+
+    resolved = str(FT._resolve_path_for_task(str(link), "default"))
+
+    assert resolved != str(target), (
+        f"an SSH-override task dereferenced a host symlink (got {resolved})")
+
+
+def test_an_unknown_backend_does_not_dereference_host_symlinks(
+        register_override, monkeypatch, tmp_path):
+    """Unknown identities must not get host semantics either."""
+    target, link = _host_symlink(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    register_override("default", {"env_type": "some-future-sandbox"})
+
+    resolved = str(FT._resolve_path_for_task(str(link), "default"))
+
+    assert resolved != str(target), (
+        f"an unknown backend dereferenced a host symlink (got {resolved})")
+
+
+def test_only_explicit_local_uses_host_path_resolution():
+    """The predicate itself: host semantics are for `local` and nothing else.
+
+    This is the invariant I wrote down last round for the approval gate and
+    did NOT apply to path resolution — "not a container" is not "is the
+    host", and SSH is the standing counter-example.
+    """
+    assert FT._uses_host_paths_for_backend("local") is True
+    for backend in ("ssh", "docker", "modal", "managed_modal", "daytona",
+                    "singularity", "vercel_sandbox", "some-future-sandbox",
+                    "", None):
+        assert FT._uses_host_paths_for_backend(backend) is False, backend
+
+
+def test_local_still_dereferences_host_symlinks(no_live_environment, monkeypatch, tmp_path):
+    """Fail-open guard: a genuinely local task keeps host resolution."""
+    target, link = _host_symlink(tmp_path)
+    no_live_environment("default")
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    resolved = str(FT._resolve_path_for_task(str(link), "default"))
+    assert resolved == str(target), (
+        "a local task stopped resolving host symlinks — host path semantics "
+        f"regressed (got {resolved})")
