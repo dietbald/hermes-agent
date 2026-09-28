@@ -271,12 +271,17 @@ def test_absent_target_still_previews_as_a_creation(tmp_path):
 
 
 def test_large_preview_read_is_bounded(tmp_path):
-    """A huge target must not be pulled whole into the agent process."""
+    """A large-but-readable target must not be pulled whole into the process.
+
+    Sized UNDER the 4 MiB preimage cap: above it the read is truncated and
+    ``_current_file_text`` fails closed instead, which round 14 covers
+    separately. The property here is cost, not correctness of the cap.
+    """
     import resource
 
     big = tmp_path / "AGENTS.md"
     with open(big, "wb") as fh:
-        fh.write(b"a" * (8 * 1024 * 1024))
+        fh.write(b"a" * (2 * 1024 * 1024))
 
     before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     t0 = time.time()

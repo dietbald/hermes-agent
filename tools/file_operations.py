@@ -2061,6 +2061,11 @@ class ShellFileOperations(FileOperations):
             "            break\n"
             "        chunks.append(b)\n"
             "        got += len(b)\n"
+            # One extra byte decides truncation on the SAME descriptor. Using
+            # a separate size probe would reintroduce the pathname race this
+            # method exists to remove (TJS-259 round 14).
+            "    more = os.read(fd, 1) if got >= limit else b''\n"
+            "    sys.stdout.write('1' if more else '0')\n"
             "    sys.stdout.write('__hermes_b64__')\n"
             "    sys.stdout.write(base64.b64encode(b''.join(chunks)).decode())\n"
             "    sys.stdout.write('\\n')\n"
@@ -2097,14 +2102,21 @@ class ShellFileOperations(FileOperations):
         # which is indistinguishable from "no output" without the marker. That
         # made every empty target read as unreadable, which fails closed and
         # would have blocked ordinary writes to empty protected files.
-        if not answer.startswith("__hermes_b64__"):
+        marker = answer.find("__hermes_b64__")
+        if marker < 0:
             return ReadResult(error=f"Failed to read file: {path}")
-        payload = answer[len("__hermes_b64__"):]
+        # The flag before the marker says whether bytes remain past the cap.
+        # A prefix that does not say so is how an over-cap preimage passed for
+        # a complete one, letting a tail-deleting write render an empty diff
+        # (TJS-259 round 14).
+        truncated = answer[:marker].strip().endswith("1")
+        payload = answer[marker + len("__hermes_b64__"):]
         try:
             raw = base64.b64decode(payload, validate=True) if payload else b""
         except Exception:
             return ReadResult(error=f"Failed to read file: {path}")
-        return ReadResult(content=raw.decode("utf-8", errors="replace"))
+        return ReadResult(content=raw.decode("utf-8", errors="replace"),
+                          truncated=truncated)
 
     def content_digest(self, path: str) -> Optional[str]:
         """Backend-side streaming SHA-256 (see the base-class contract).

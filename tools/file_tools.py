@@ -942,6 +942,15 @@ def _current_file_text(filepath: str, task_id: str = "default") -> str:
             return ""
         raise _PreimageUnavailable(str(filepath))
 
+    if getattr(result, "truncated", False):
+        # A PREFIX IS NOT A PREIMAGE (TJS-259 round 14). Returning the first
+        # N bytes as though they were the whole file let a write whose
+        # content equalled that prefix render an EMPTY diff: the preview
+        # collapsed to None, the gate degraded to a target-only card with no
+        # change summary, and the approved write silently truncated the file.
+        # The user cannot review bytes nobody read, so this fails closed.
+        raise _PreimageUnavailable(str(filepath))
+
     content = getattr(result, "content", None)
     if content is None:
         # A binary/image read returns no content and no error. There is no
@@ -1112,40 +1121,69 @@ _ENV_TYPE_KEY = "env_type"
 
 
 def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
-    """Whether this task's file backend is the agent process's own filesystem.
+    """Whether THIS TASK's file backend is the agent process's own filesystem.
 
     When it is, host ``os.path.realpath`` and the backend's realpath are the
     same answer, and asking the backend costs a subprocess per write. When it
     is NOT (docker/ssh/modal/...), only the backend can answer and the host's
     view is actively wrong (TJS-259 round 12).
 
-    Fails CLOSED in every ambiguous case (TJS-259 round 13). The first version
-    read ``_get_env_config()["type"]``; the real key is ``env_type``, so the
-    lookup returned ``None`` for EVERY backend, defaulted to ``"local"``, and
-    took the host fast path unconditionally — including under Docker, which is
-    the case the backend realpath exists for. A protected write through a
-    backend-only symlink then completed with no card.
+    Two independent signals must BOTH say "local" (round 14). The global
+    config alone missed a task-scoped Docker environment; the task
+    environment alone would let a stale local entry override a
+    Docker-configured session. Either one saying non-local wins, because the
+    cost of being wrong that way is a subprocess and the cost of being wrong
+    the other way is an unapproved write to a protected file.
 
-    The shape matters more than the key. A missing key, an unreadable config
-    and an unrecognised backend all answer "not local": the cost of being
-    wrong that way is a subprocess, while the cost of being wrong the other
-    way is an unapproved write to a protected file.
+    Fails CLOSED in every ambiguous case (round 13): an unreadable config, a
+    missing config key, an unrecognised backend and an unclassifiable task
+    environment all answer "not local".
     """
+    # Signal 1 — the global configuration.
     try:
         from tools.terminal_tool import _get_env_config
         config = _get_env_config() or {}
     except Exception:
         return False
     if _ENV_TYPE_KEY not in config:
-        # The key was renamed or the config is not the shape we expect. We
-        # cannot tell what backend this is, so we do not trust the host.
         logger.warning(
             "terminal env config has no %r key; treating the file backend as "
             "non-local so approval gating resolves paths through it",
             _ENV_TYPE_KEY)
         return False
-    env_type = str(config.get(_ENV_TYPE_KEY) or "").strip().lower()
-    return env_type in _HOST_FILESYSTEM_BACKENDS
+    if str(config.get(_ENV_TYPE_KEY) or "").strip().lower() \
+            not in _HOST_FILESYSTEM_BACKENDS:
+        return False
+
+    # Signal 2 — the environment actually bound to THIS TASK, which is what
+    # performs the write. A task override is invisible to the global config.
+    try:
+        from tools.terminal_tool import (
+            _active_environments, _env_lock, _resolve_container_task_id,
+        )
+        try:
+            container_key = _resolve_container_task_id(task_id)
+        except Exception:
+            container_key = task_id
+        with _env_lock:
+            env = (_active_environments.get(container_key)
+                   or _active_environments.get(task_id))
+    except Exception:
+        return False
+    if env is None:
+        return True  # no task override: the global answer stands
+    name = env.__class__.__name__.lower()
+    if "local" in name:
+        return True
+    stamped = getattr(env, "_hermes_backend_name", None)
+    if isinstance(stamped, str) and \
+            stamped.strip().lower() in _HOST_FILESYSTEM_BACKENDS:
+        return True
+    logger.warning(
+        "task %r has a non-local or unrecognised terminal environment %s; "
+        "treating the file backend as non-local so approval gating resolves "
+        "through it", task_id, env.__class__.__name__)
+    return False
 
 
 def _plan_realpaths(paths: list[str], plan: "dict[str, str | None] | None",
