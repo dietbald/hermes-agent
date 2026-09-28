@@ -216,7 +216,7 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
-def is_write_approval_required(path: str) -> bool:
+def is_write_approval_required(path: str, resolved: Optional[str] = None) -> bool:
     """Return True if ``path`` is an approval-gated write target.
 
     These paths (currently ``~/.ssh/config``) are not credentials and are
@@ -224,9 +224,16 @@ def is_write_approval_required(path: str) -> bool:
     because they can influence process execution (e.g. an SSH
     ``ProxyCommand``). Callers with an interactive/gateway channel should
     prompt; callers without one should treat this as a block (fail closed).
+
+    ``resolved`` lets a caller that has ALREADY resolved the path pass its
+    own answer in, so the gate decision and the write cannot be about two
+    different files (TJS-259 round 10). Resolving here independently meant a
+    symlink retargeted between the caller's resolution and this one made the
+    gate answer about a file the write never touched.
     """
     home = os.path.realpath(os.path.expanduser("~"))
-    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    if resolved is None:
+        resolved = os.path.realpath(os.path.expanduser(str(path)))
     return resolved in build_write_approval_paths(home)
 
 

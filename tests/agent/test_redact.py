@@ -627,6 +627,53 @@ class TestLowercaseDottedConfigKeys:
         assert "server.port=8080" in result  # non-secret keys preserved
         assert "username=admin" in result
 
+    def test_url_line_does_not_disable_config_redaction(self):
+        opaque = "opaquevalue" + "1234567890abcd"
+        password = "hunter2" + "hunter2xyz"
+        url = "endpoint: https://x/a?access_token=abc123def456"
+        text = (
+            f"api_key: {opaque}\n"
+            f"password: {password}\n"
+            "spring.datasource.password=PropertiesSecret123\n"
+            f"{url}"
+        )
+
+        result = redact_sensitive_text(text, force=True)
+
+        assert opaque not in result
+        assert password not in result
+        assert "PropertiesSecret123" not in result
+        # The default URL pass-through contract remains unchanged.
+        assert url in result
+
+    @pytest.mark.parametrize(
+        "key",
+        ["deploy_key", "ssh_key", "signing_key", "webhook_secret", "bot_token"],
+    )
+    def test_explicit_credential_config_keys_are_redacted(self, key):
+        opaque = "opaquevalue" + "1234567890abcd"
+        result = redact_sensitive_text(f"{key}: {opaque}", force=True)
+        assert opaque not in result
+
+    def test_explicit_credential_keys_cover_structured_surfaces(self):
+        opaque = "opaquevalue" + "1234567890abcd"
+        samples = [
+            redact_sensitive_text(f'{"{"}"deploy_key": "{opaque}"{"}"}', force=True),
+            redact_sensitive_text(
+                f"deploy_key={opaque}&name=worker", force=True
+            ),
+            redact_sensitive_text(
+                f"https://x.test/?deploy_key={opaque}",
+                force=True,
+                redact_url_credentials=True,
+            ),
+        ]
+        assert all(opaque not in result for result in samples)
+
+    def test_noncredential_json_keys_remain_unchanged(self):
+        text = '{"token_count": "17", "session_id": "public"}'
+        assert redact_sensitive_text(text, force=True) == text
+
     # --- carve-outs: must NOT redact ---
 
     def test_prose_mid_sentence_password_unchanged(self):

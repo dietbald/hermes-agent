@@ -3,6 +3,7 @@
 
 import base64
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
@@ -171,6 +173,45 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
+#: Built-in environment classes mapped to their backend type, by EXACT class
+#: name. Used only when an environment carries no ``_hermes_backend_name``
+#: stamp. Exact identity, never a substring: plugin class names are arbitrary,
+#: so ``LocalisedCloudSandboxEnvironment`` contains "local" while being a
+#: remote sandbox (TJS-259 round 17). Plugin objects that cannot be stamped
+#: are NOT in here by design — they fall back to the configured backend.
+#:
+#: Every VALUE must be a backend ``_is_container_backend`` recognises, because
+#: that predicate decides whether paths are mapped into the container. Round
+#: 18: ``ManagedModalEnvironment`` was mapped to ``managed_modal``, which is
+#: NOT in ``_CONTAINER_BACKENDS``, so a gateway-owned Modal sandbox got host
+#: path semantics. It maps to ``modal`` — the ``env_type`` it is built from
+#: (``_create_environment(env_type="modal")`` returns it when the managed
+#: backend is selected) and a real remote sandbox either way. A table whose
+#: keys are complete but whose values are wrong is no safer than no table.
+_BUILTIN_ENV_CLASS_BACKENDS = {
+    "LocalEnvironment": "local",
+    "SSHEnvironment": "ssh",
+    "DockerEnvironment": "docker",
+    "SingularityEnvironment": "singularity",
+    "ModalEnvironment": "modal",
+    "ManagedModalEnvironment": "modal",
+    "DaytonaEnvironment": "daytona",
+    "VercelSandboxEnvironment": "vercel_sandbox",
+}
+
+#: Backend-image override keys mapped to the backend they name. A task may
+#: declare its backend by image key instead of ``env_type``, and that names a
+#: remote backend just as surely (TJS-259 round 19). Must cover every key in
+#: ``terminal_tool._ISOLATION_OVERRIDE_KEYS`` except ``env_type`` itself,
+#: which is read directly — a new isolation key missing from here would
+#: silently leave path resolution on host semantics. Pinned by a test.
+_OVERRIDE_IMAGE_KEY_BACKENDS = {
+    "docker_image": "docker",
+    "modal_image": "modal",
+    "singularity_image": "singularity",
+    "daytona_image": "daytona",
+}
+
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
@@ -189,29 +230,93 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         with _env_lock:
             env = _active_environments.get(container_key) or _active_environments.get(task_id)
         if env is not None:
-            name = env.__class__.__name__.lower()
-            if "local" in name:
-                return "local"
-            if "ssh" in name:
-                return "ssh"
-            if "docker" in name:
-                return "docker"
-            if "singularity" in name:
-                return "singularity"
-            if "modal" in name:
-                return "modal"
-            if "daytona" in name:
-                return "daytona"
+            # The stamp comes FIRST (TJS-259 round 16). Plugin environments
+            # are duck-typed, so their class names carry no guarantee; the
+            # provider factory stamps ``_hermes_backend_name`` precisely so
+            # path resolution does not have to sniff class names. Consulting
+            # it only as a fallback meant a plugin stamped ``docker`` whose
+            # class name contained "local" was resolved with HOST path
+            # semantics instead of container ones.
             stamped = getattr(env, "_hermes_backend_name", None)
-            if isinstance(stamped, str) and stamped:
-                return stamped
+            if isinstance(stamped, str) and stamped.strip():
+                return stamped.strip().lower()
+            # Unstamped. The factory stamps inside
+            # ``try/except AttributeError: pass``, so an object using
+            # ``__slots__`` or a read-only ``__setattr__`` reaches here with
+            # no stamp at all — a documented, supported case (round 17).
+            #
+            # Only the BUILT-IN classes may be identified by name, and by
+            # EXACT identity: a plugin's class name is arbitrary, so
+            # substring matching let ``LocalisedCloudSandboxEnvironment``
+            # pass for the host and applied host path semantics to a remote
+            # plugin namespace.
+            builtin = _BUILTIN_ENV_CLASS_BACKENDS.get(env.__class__.__name__)
+            if builtin:
+                return builtin
+            # Anything else is a plugin object that cannot identify itself.
+            # The configured backend is what the factory built it from, so
+            # it is the authoritative answer — falling through is deliberate.
+
+        # No live environment (or an unidentifiable plugin one). A registered
+        # override declares the backend BEFORE ``_get_file_ops`` lazily
+        # creates the object, so it is the only evidence that exists in that
+        # window (TJS-259 round 19). Round 15 taught the approval classifier
+        # this; the sibling never learned it, so path resolution used HOST
+        # semantics — and dereferenced host symlinks — for a task whose
+        # backend is a container.
+        #
+        # ``resolve_task_overrides`` is the canonical reader (raw id first,
+        # then collapsed container id), the same one the terminal layer uses
+        # to decide what to build, so the two cannot disagree.
+        try:
+            from tools.terminal_tool import (
+                resolve_task_overrides,
+            )
+            overrides = resolve_task_overrides(task_id) or {}
+        except Exception:
+            overrides = {}
+        declared = overrides.get("env_type")
+        if isinstance(declared, str) and declared.strip():
+            return declared.strip().lower()
+        # A backend-image override names a remote backend just as surely as
+        # env_type does; a cwd-only override is a workspace hint and must not
+        # change path semantics. Map the image key to its backend.
+        for _key, _backend in _OVERRIDE_IMAGE_KEY_BACKENDS.items():
+            if overrides.get(_key):
+                return _backend
+
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
 
 
+def _uses_host_paths_for_backend(env_type: str | None) -> bool:
+    """Whether *env_type*'s paths may be resolved with HOST semantics.
+
+    ONLY ``local``. This is deliberately not the negation of
+    "is a container" (TJS-259 round 20): SSH is not a container backend —
+    its paths are not mapped into a sandbox namespace — but its filesystem
+    is emphatically not the agent's either. Treating "not a container" as
+    "is the host" made ``_resolve_path_for_task`` dereference a HOST symlink
+    for an SSH task, rewriting the path in the wrong filesystem namespace
+    before the remote ``FileOperations`` could resolve it.
+
+    Unknown and empty identities answer False: a backend nobody recognises
+    must not be handed the host's symlink graph. The cost of being wrong that
+    way is a path left unresolved for the backend to resolve itself, which is
+    what a remote backend wants anyway.
+    """
+    return str(env_type or "").strip().lower() in _HOST_FILESYSTEM_BACKENDS
+
+
 def _uses_container_paths(task_id: str = "default") -> bool:
+    """Whether this task's paths live in a container namespace.
+
+    Answers "is it a container", NOT "is it remote" — see
+    :func:`_uses_host_paths_for_backend` for the distinction. Callers
+    deciding whether HOST resolution is permissible must ask that one.
+    """
     env_type = _terminal_env_type_for_task(task_id)
     try:
         from tools.terminal_tool import _is_container_backend
@@ -219,6 +324,11 @@ def _uses_container_paths(task_id: str = "default") -> bool:
         return _is_container_backend(env_type)
     except Exception:
         return env_type in _CONTAINER_PATH_BACKENDS_FALLBACK
+
+
+def _uses_host_paths(task_id: str = "default") -> bool:
+    """Whether this task's paths may be resolved with HOST semantics."""
+    return _uses_host_paths_for_backend(_terminal_env_type_for_task(task_id))
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -341,7 +451,10 @@ def _resolve_base_dir(
     """
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
-        container_paths = _uses_container_paths(task_id)
+        # "Not host" rather than "is container" (TJS-259 round 20): SSH and
+        # unknown backends are remote without being containers, and must not
+        # get host resolution.
+        container_paths = not _uses_host_paths(task_id)
     if root:
         base_text = _expand_tilde(root)
     else:
@@ -380,7 +493,7 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     translated to ``C:\\Users\\...`` before resolution so file tools don't
     treat them as relative ``\\c\\Users\\...`` under the process cwd.
     """
-    container_paths = _uses_container_paths(task_id)
+    container_paths = not _uses_host_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
@@ -428,7 +541,7 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         workspace_root = _authoritative_workspace_root(task_id)
         if not workspace_root:
             return None  # No authoritative workspace root to compare against.
-        if _uses_container_paths(task_id):
+        if not _uses_host_paths(task_id):
             root = _normalize_without_host_deref(Path(_expand_tilde(workspace_root)))
         else:
             root = Path(_expand_tilde(workspace_root)).resolve()
@@ -789,7 +902,8 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  resolved: str | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected
     agent-instruction file, else ``None``.
 
@@ -797,6 +911,14 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     neither a symlink pointing AT a protected file (#41351) nor a protected
     name that is itself a symlink escapes the gate. ``..`` traversal is
     neutralized by normpath/realpath before the basename compare.
+
+    ``resolved`` is the realpath from the caller's ONE path plan (TJS-259
+    round 10). Resolving here independently made the gate decision and the
+    write two separate questions about possibly different files: retarget a
+    symlink between the plan and this call and the gate answered "not
+    protected" about the new target while the write still went to the
+    planned protected one — a protected file overwritten with no card at
+    all. Callers on the gated write path MUST pass it.
     """
     if enabled is None or extra_patterns is None:
         enabled, extra_patterns = _protected_instruction_config()
@@ -804,10 +926,12 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         return None
 
     normalized = os.path.normpath(_expand_tilde(filepath))
-    try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
-    except (OSError, ValueError, RuntimeError):
-        resolved = os.path.realpath(normalized)
+    if resolved is None:
+        try:
+            resolved = os.path.realpath(
+                str(_resolve_path_for_task(filepath, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            resolved = os.path.realpath(normalized)
 
     # The authoritative ~/.hermes home is governed by its own guards
     # (config.yaml hard-block, cross-profile guard, write_approval); this
@@ -840,8 +964,788 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+# Budget for the diff shown on an approval card. Adapters apply their OWN
+# caps on top of this and they vary a lot (base ``_EA_CMD_BUDGET`` is 3000,
+# WhatsApp truncates the command at 800 and the whole body at 1024), so a
+# trailing "[truncated]" marker cannot be relied on to survive. Hence two
+# defenses: keep this well under the smallest plausible cap, AND lead with
+# the summary line (see ``_build_write_preview``) so the file name and
+# change size are the first thing any truncation keeps.
+_WRITE_PREVIEW_BUDGET = 1500
+
+
+class _WritePreview(NamedTuple):
+    """What an approval card should show about a pending content write.
+
+    ``diff`` is the (already truncated + redacted) text rendered in the
+    card's fenced block; ``summary`` is the one-line ``+N/-M lines`` shape
+    folded into the card's reason text.
+
+    A preview is PRESENTATION ONLY (TJS-258). It deliberately carries no
+    identity field any more: every identity defect in the TJS-256 review
+    came from keying a grant on something the preview produced (the card's
+    command text, the redacted diff, the snippet diff body). Authorization
+    identity is built separately by ``_write_request_identity`` from the
+    write REQUEST, before any preview or redaction exists.
+    """
+    diff: str
+    summary: str
+
+
+class _PreimageUnavailable(Exception):
+    """The reviewed preimage could not be read from the task backend.
+
+    Raised rather than returned so it cannot be mistaken for "the file is
+    empty". ``_build_write_preview`` converts it to ``PREVIEW_FAILED``, which
+    both gates already treat as "block, do not raise a card" (TJS-258).
+    """
+
+
+def _current_file_text(filepath: str, task_id: str = "default") -> str:
+    """The file's current text, read through the TASK FILE BACKEND.
+
+    Used to build the approval card's preimage — the "before" side of the
+    diff the user is asked to approve.
+
+    Read through ``_get_file_ops(task_id)``, the same object that performs
+    the write and that the authorization identity already hashes (TJS-259
+    round 11). This previously read the HOST filesystem with ``Path`` while
+    identity and mutation went through the backend. Under a container or SSH
+    backend those are different filesystems: a target absent on the host but
+    present on the backend rendered as a brand-new file (``+1/-0``) with the
+    remote contents the write was about to destroy omitted entirely. The user
+    then approved a change that was not the one performed.
+
+    Three outcomes, deliberately distinct:
+
+    text
+        The backend's current contents.
+    ``""``
+        The path does not exist on the backend — a genuine creation, which is
+        an honest thing to show as ``+n/-0``.
+    :class:`_PreimageUnavailable`
+        The backend could not answer. NOT empty: falling back to ``""`` is
+        exactly how an overwrite gets presented as a creation, so this fails
+        closed instead.
+    """
+    try:
+        ops = _get_file_ops(task_id)
+    except Exception as exc:
+        raise _PreimageUnavailable(str(filepath)) from exc
+
+    # ONE non-blocking descriptor: type check and read happen on the same
+    # open file, never on a pathname twice (TJS-259 round 12).
+    # ``read_file_raw`` probed ``-f``/size and then re-opened the pathname for
+    # ``head`` and ``cat``; retargeting a symlink to a FIFO after the probe
+    # blocked the preview before a card could be raised.
+    try:
+        result = ops.read_text_bounded(filepath)
+    except Exception as exc:
+        raise _PreimageUnavailable(str(filepath)) from exc
+
+    if getattr(result, "error", None):
+        # "Missing" and "unreadable" must not be confused: an absent target
+        # is an honest creation, an unreadable one is a block. The backend
+        # reports which it is on the descriptor it actually opened, so this
+        # no longer depends on parsing an error string or on a second,
+        # racy existence probe.
+        if getattr(result, "path_absent", False):
+            return ""
+        raise _PreimageUnavailable(str(filepath))
+
+    if getattr(result, "truncated", False):
+        # A PREFIX IS NOT A PREIMAGE (TJS-259 round 14). Returning the first
+        # N bytes as though they were the whole file let a write whose
+        # content equalled that prefix render an EMPTY diff: the preview
+        # collapsed to None, the gate degraded to a target-only card with no
+        # change summary, and the approved write silently truncated the file.
+        # The user cannot review bytes nobody read, so this fails closed.
+        raise _PreimageUnavailable(str(filepath))
+
+    content = getattr(result, "content", None)
+    if content is None:
+        # A binary/image read returns no content and no error. There is no
+        # text to review, and the write tools already refuse binary targets
+        # separately, so treat it as unreviewable rather than empty.
+        raise _PreimageUnavailable(str(filepath))
+    return content
+
+
+#: Sentinel for a path whose current state could not be read. It is NOT a
+#: usable identity component: two unreadable states are not "the same state",
+#: so a gate that sees it must BLOCK rather than compare (TJS-259 round 7,
+#: defect 2 — a stable ``unreadable`` literal matched itself and let a grant
+#: be redeemed against changed bytes of a write-only file).
+_STATE_UNREADABLE = "unreadable"
+_STATE_ABSENT = "absent"
+
+
+def _path_state_digest(filepath: str, task_id: str = "default") -> str:
+    """Digest of a path's CURRENT bytes, for the authorization identity.
+
+    TJS-259 round 6. The user does not approve a request in the abstract; they
+    approve a *change* — the request applied to the state the card showed
+    them. A released grant has no expiry, so binding only the request lets the
+    source state move underneath a waiting card: edit the target (or a
+    ``*** Move File:`` source) while the card waits and the resumed call
+    rebuilds an identical request identity, redeems the grant, and writes
+    something the user was never shown. Both were reproduced live.
+
+    Read through the BACKEND, not the host (round 7, defect 1). Previously
+    this called host ``Path.exists()``/``open()`` while the write itself goes
+    through ``ShellFileOperations`` in whatever terminal environment the task
+    owns. Under a container backend those are two different filesystems: two
+    distinct remote states both mapped to the same absent host path, so the
+    digests collided and the grant was reused. Going through
+    ``_get_file_ops(task_id)`` — the exact object that performs the write —
+    makes "the state I hashed" and "the state I am about to overwrite" the
+    same file by construction, instead of by a backend-type branch that can
+    be got wrong later.
+
+    Hashed ON the backend, never transported (round 8, defect 2). Pulling
+    whole-file base64 across the boundary to hash it here materialized the
+    file several times in the agent process — a 32 MiB probe took peak RSS
+    from ~51 MB to ~223 MB and 2.37 s — so a large gated Move/Delete source
+    could exhaust the process, twice (gate, then drift re-check). Only a
+    64-char hex digest crosses now, so cost is bounded by the file's size on
+    the backend alone and no size ceiling is needed.
+
+    Three outcomes, deliberately distinct:
+
+    ``absent``
+        No such path. Different from an empty file, which is a state the user
+        would decide about differently.
+    :data:`_STATE_UNREADABLE`
+        The state could not be determined. Callers must treat this as "cannot
+        authorize", never as an identity to compare — see the constant.
+    a digest
+        SHA-256 over the file's bytes as the backend sees them.
+    """
+    try:
+        ops = _get_file_ops(task_id)
+    except Exception:
+        return _STATE_UNREADABLE
+    try:
+        digest = ops.content_digest(filepath)
+    except Exception:
+        digest = None
+    if digest:
+        return digest
+    # No digest is AMBIGUOUS: missing and unreadable both fail that way, and
+    # the shell backend reports both as "File not found" on the read path, so
+    # parsing an error message would reintroduce round 7's defect 2 (an
+    # unreadable file classified as `absent`, a stable value that matches
+    # itself). Ask the backend directly; "cannot tell" stays unreadable, so
+    # every ambiguous case fails closed.
+    try:
+        exists = ops.path_exists(filepath)
+    except Exception:
+        exists = None
+    return _STATE_ABSENT if exists is False else _STATE_UNREADABLE
+
+
+def _resolve_write_targets(paths: list[str], task_id: str = "default", *,
+                           plan: "dict[str, str | None] | None" = None) -> list[str]:
+    """Sorted, deduplicated resolved targets of a write request.
+
+    ``plan`` supplies an already-built path→resolved map so authorization,
+    locking and mutation all derive from ONE resolution. Resolving a second
+    time is what let the written path differ from the reviewed and locked one
+    when a symlinked target was retargeted mid-approval (TJS-259 round 8).
+    """
+    resolved: list[str] = []
+    for p in paths or []:
+        planned = plan.get(p) if plan is not None else None
+        if planned:
+            resolved.append(planned)
+            continue
+        try:
+            resolved.append(str(_resolve_path_for_task(p, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            # An unresolvable path is still a distinct target; use the
+            # normalized input rather than dropping it (dropping would make
+            # two different requests look identical).
+            resolved.append(os.path.normpath(_expand_tilde(p)))
+    return sorted(dict.fromkeys(resolved))
+
+
+def _capture_path_states(targets: list[str],
+                         task_id: str = "default") -> list[str]:
+    """State of each target, positionally aligned with *targets*."""
+    return [_path_state_digest(t, task_id) for t in targets]
+
+
+def _unverifiable_state_error(targets: list[str], states: list[str]) -> str | None:
+    """BLOCKED message when any target's state cannot be established.
+
+    Fail closed, and fail *loudly*: raising a card the user cannot meaningfully
+    answer (the card would describe a change against a state nobody can read)
+    would loop forever, because the state stays unreadable on every resume. A
+    plain block names the path and ends the attempt.
+    """
+    bad = [t for t, s in zip(targets, states) if s == _STATE_UNREADABLE]
+    if not bad:
+        return None
+    return (
+        "BLOCKED: cannot verify the current contents of "
+        f"{', '.join(bad)}, so this write cannot be authorized — an approval "
+        "must be bound to the state it was reviewed against. Fix the path's "
+        "readability (permissions, file type, backend availability) and retry."
+    )
+
+
+def _state_drift_error(targets: list[str], approved_states: list[str],
+                       task_id: str = "default") -> str | None:
+    """BLOCKED message when a target changed after the gate decided.
+
+    TJS-259 round 7, defect 3. The gate runs before ``file_state.lock_path``,
+    so between "this identity redeemed the grant" and "the bytes are written"
+    another writer — a concurrent subagent, which is a supported and
+    deliberately serialized case — can change the file. The lock exists for
+    exactly those writers, so the check has to happen *inside* it. Re-reading
+    here and refusing on any difference closes the window: whatever the gate
+    authorized is what gets overwritten, or nothing is.
+    """
+    current = _capture_path_states(targets, task_id)
+    changed = [t for t, before, after in zip(targets, approved_states, current)
+               if before != after or after == _STATE_UNREADABLE]
+    if not changed:
+        return None
+    return (
+        f"BLOCKED: {', '.join(changed)} changed after this write was "
+        "approved, so the approval no longer covers it. Nothing was written. "
+        "Re-read the file and retry — that will raise a fresh approval for "
+        "the current contents."
+    )
+
+
+#: Backend types whose filesystem IS the agent process's own. Only these may
+#: use the host fast path in :func:`_plan_realpaths`. An allowlist, not a
+#: blocklist: a backend nobody anticipated must be asked, never assumed
+#: local (TJS-259 round 13).
+_HOST_FILESYSTEM_BACKENDS = frozenset({"local"})
+
+#: Built-in environment classes whose filesystem IS the host's, matched by
+#: EXACT class name. Only consulted when an environment carries no
+#: ``_hermes_backend_name`` stamp. Derived from the single
+#: ``_BUILTIN_ENV_CLASS_BACKENDS`` table so this gate and path resolution
+#: cannot disagree about what a class name means (TJS-259 rounds 16-17).
+_HOST_FILESYSTEM_ENV_CLASSES = frozenset(
+    cls for cls, backend in _BUILTIN_ENV_CLASS_BACKENDS.items()
+    if backend in _HOST_FILESYSTEM_BACKENDS
+)
+
+#: Key ``_get_env_config`` reports the backend type under. Asserted against
+#: the real config at import-time-ish in the tests, because reading a key
+#: that does not exist is exactly the round-13 defect.
+_ENV_TYPE_KEY = "env_type"
+
+
+def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
+    """Whether THIS TASK's file backend is the agent process's own filesystem.
+
+    When it is, host ``os.path.realpath`` and the backend's realpath are the
+    same answer, and asking the backend costs a subprocess per write. When it
+    is NOT (docker/ssh/modal/...), only the backend can answer and the host's
+    view is actively wrong (TJS-259 round 12).
+
+    Three signals, and ALL of them must say "local" (round 15). Each covers a
+    window the others miss:
+
+    1. The global configuration.
+    2. The env overrides REGISTERED for this task. These declare the backend
+       before ``_get_file_ops`` lazily creates the environment object, so in
+       that window the registry is the only evidence that exists — trusting
+       the global config there let host realpath clear a write that the
+       remote backend, created moments later, then performed.
+    3. The environment object actually bound to this task, once it exists.
+
+    Any one saying non-local wins, because the cost of being wrong that way
+    is a subprocess and the cost of being wrong the other way is an
+    unapproved write to a protected file.
+
+    Fails CLOSED in every ambiguous case (round 13): an unreadable config, a
+    missing config key, an unrecognised backend and an unclassifiable task
+    environment all answer "not local".
+    """
+    # Signal 1 — the global configuration.
+    try:
+        from tools.terminal_tool import _get_env_config
+        config = _get_env_config() or {}
+    except Exception:
+        return False
+    if _ENV_TYPE_KEY not in config:
+        logger.warning(
+            "terminal env config has no %r key; treating the file backend as "
+            "non-local so approval gating resolves paths through it",
+            _ENV_TYPE_KEY)
+        return False
+    if str(config.get(_ENV_TYPE_KEY) or "").strip().lower() \
+            not in _HOST_FILESYSTEM_BACKENDS:
+        return False
+
+    # Signal 2 — overrides REGISTERED for this task, which exist before the
+    # environment object does. ``resolve_task_overrides`` is the canonical
+    # reader (raw id first, then collapsed container id); using it keeps this
+    # gate from drifting away from what the terminal layer will actually
+    # build.
+    try:
+        from tools.terminal_tool import (
+            _ISOLATION_OVERRIDE_KEYS, resolve_task_overrides,
+        )
+        overrides = resolve_task_overrides(task_id) or {}
+    except Exception:
+        return False
+    declared = overrides.get(_ENV_TYPE_KEY)
+    if declared is not None:
+        if str(declared).strip().lower() not in _HOST_FILESYSTEM_BACKENDS:
+            return False
+    elif set(overrides) & set(_ISOLATION_OVERRIDE_KEYS):
+        # A backend-image override (docker_image/modal_image/...) names a
+        # remote backend just as surely as env_type does. A cwd-only override
+        # is a workspace hint, not a backend declaration, and deliberately
+        # does NOT force the slow path.
+        logger.warning(
+            "task %r registered backend-image overrides %s; treating the file "
+            "backend as non-local so approval gating resolves through it",
+            task_id, sorted(set(overrides) & set(_ISOLATION_OVERRIDE_KEYS)))
+        return False
+
+    # Signal 3 — the environment actually bound to THIS TASK, once created.
+    try:
+        from tools.terminal_tool import (
+            _active_environments, _env_lock, _resolve_container_task_id,
+        )
+        try:
+            container_key = _resolve_container_task_id(task_id)
+        except Exception:
+            container_key = task_id
+        with _env_lock:
+            env = (_active_environments.get(container_key)
+                   or _active_environments.get(task_id))
+    except Exception:
+        return False
+    if env is None:
+        # No environment yet AND no remote override declared above: the
+        # global answer stands.
+        return True
+
+    # The STAMP is authoritative (round 16). ``agent/terminal_env_provider.py``
+    # states the factory stamps ``_hermes_backend_name`` precisely "so
+    # file-path resolution can identify plugin backends without class-name
+    # sniffing" — plugin environments are duck-typed and need not subclass
+    # BaseEnvironment, so their class names carry no guarantee whatsoever.
+    # Checking the class name FIRST meant a plugin stamped ``docker`` whose
+    # class merely contained "local" was treated as the host filesystem, and
+    # a protected backend target was written with no card.
+    stamped = getattr(env, "_hermes_backend_name", None)
+    if isinstance(stamped, str) and stamped.strip():
+        declared = stamped.strip().lower()
+        if declared in _HOST_FILESYSTEM_BACKENDS:
+            return True
+        logger.warning(
+            "task %r has a terminal environment stamped %r; treating the file "
+            "backend as non-local so approval gating resolves through it",
+            task_id, declared)
+        return False
+
+    # Unstamped: only the built-in environments this file knows by name may
+    # take the fast path, matched by EXACT class identity. Substring matching
+    # is what let ``LocalisedSandboxEnvironment`` pass for the host.
+    if env.__class__.__name__ in _HOST_FILESYSTEM_ENV_CLASSES:
+        return True
+    logger.warning(
+        "task %r has a non-local or unrecognised terminal environment %s; "
+        "treating the file backend as non-local so approval gating resolves "
+        "through it", task_id, env.__class__.__name__)
+    return False
+
+
+def _plan_realpaths(paths: list[str], plan: "dict[str, str | None] | None",
+                    task_id: str = "default") -> dict[str, str]:
+    """Realpath of each raw path, resolved BY THE TASK BACKEND.
+
+    TJS-259 rounds 10 and 12. Every resolution on the gated write path must
+    come from the same plan AND the same filesystem, including the ones that
+    decide WHETHER a gate applies. ``_resolve_path_for_task`` maps a path into
+    the task's workspace; the backend's ``realpath`` then follows symlinks,
+    which is what the protected-file and ssh-config predicates match on.
+
+    Host ``os.path.realpath`` was wrong here (round 12): a container/SSH
+    backend can have ``notes.md -> AGENTS.md`` while the host sees an ordinary
+    file, so the gate answered "not protected" about the host's view while the
+    write followed the backend's symlink into the protected file, with no card
+    at all. Resolving through ``_get_file_ops(task_id)`` — the object that
+    performs the write — makes the checked path and the written path the same
+    by construction.
+
+    On a LOCAL backend the two are the same filesystem, so the host call is
+    used directly: this runs on every write, gated or not, and a backend
+    subprocess per write would be the cost regression round 7 fixed.
+
+    Fails CLOSED: when a non-local backend cannot resolve, the value is a
+    sentinel that no predicate matches and ``_write_gate_applies`` treats as
+    gated. An unresolved path must never read as "ordinary, no approval".
+    """
+    local = _backend_shares_the_host_filesystem(task_id)
+    ops = None
+    if not local:
+        try:
+            ops = _get_file_ops(task_id)
+        except Exception:
+            ops = None
+
+    out: dict[str, str] = {}
+    for p in paths or []:
+        planned = plan.get(p) if plan is not None else None
+        if not planned:
+            try:
+                planned = str(_resolve_path_for_task(p, task_id))
+            except (OSError, ValueError, RuntimeError):
+                planned = os.path.normpath(_expand_tilde(p))
+        resolved = None
+        if local:
+            try:
+                resolved = os.path.realpath(planned)
+            except (OSError, ValueError):
+                resolved = None
+        elif ops is not None:
+            try:
+                resolved = ops.realpath(planned)
+            except Exception:
+                resolved = None
+        out[p] = resolved if resolved else _UNRESOLVED_PATH
+    return out
+
+
+#: Marker for a target the backend could not resolve. Deliberately not a
+#: path: it must not match a protected basename NOR look like an ordinary
+#: file. ``_write_gate_applies`` checks for it explicitly and answers
+#: "gated", so an unresolvable target is always reviewed by a human rather
+#: than silently cleared (TJS-259 round 12).
+_UNRESOLVED_PATH = "\x00hermes-unresolved\x00"
+
+
+def _write_gate_applies(paths: list[str], task_id: str = "default", *,
+                        realpaths: "dict[str, str] | None" = None) -> bool:
+    """Whether any approval gate will look at this request.
+
+    TJS-259 round 7, defect 4: identity (and therefore state hashing) used to
+    be built unconditionally, so every ordinary write hashed every touched
+    path — a measured 1.178 s on a 1 GiB file, and it turned a V4A
+    Delete/Move of a large unprotected file from metadata-bound into a full
+    read. Nothing outside the gates consumes the identity, so it is only
+    computed when a gate exists to consume it.
+
+    Deliberately uses the same predicates the gates themselves use, so the
+    two cannot drift apart on what "gated" means. A drift here is NOT
+    self-correcting: the caller skips both gates entirely when this returns
+    false, so a false negative silently skips approval altogether. (An
+    earlier comment claimed such a case would hand the gate ``identity=None``
+    and fail closed — that was wrong, and the round-8 review was right to
+    call it out.) Any change to either gate's trigger MUST be mirrored here;
+    an exception while deciding therefore answers "gated", the only safe
+    default.
+    """
+    try:
+        # An unresolvable target is never "ordinary": the backend could not
+        # tell us what file it is, so a human must look (round 12).
+        if any((realpaths or {}).get(p) == _UNRESOLVED_PATH for p in paths):
+            return True
+        enabled, extra = _protected_instruction_config()
+        if enabled and any(
+                _protected_instruction_reason(
+                    p, task_id, enabled=enabled, extra_patterns=extra,
+                    resolved=(realpaths or {}).get(p))
+                for p in paths):
+            return True
+    except Exception:
+        return True  # cannot tell → assume gated (fail safe)
+    try:
+        from agent.file_safety import is_write_approval_required
+        if any(is_write_approval_required(p, (realpaths or {}).get(p))
+               for p in paths):
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _redact_diff_text(lines: list[str]) -> str:
+    """Redact a unified diff for display on an approval card.
+
+    TWO passes are required, because the redactor's rules disagree about
+    what a "text" is and neither pass alone is sufficient:
+
+    1. **Per line, marker stripped.** Its config-file rules (``api_key:
+       …``, ``password: …``) are line-anchored, so a leading ``+``/``-``
+       pushes the key off the start of the line and the value survives.
+       Its YAML pass is also gated on ``"://" not in text`` across the
+       WHOLE blob, so one URL anywhere would disable config redaction for
+       every other line. Redacting each line alone fixes both.
+    2. **The assembled blob.** Multiline rules — notably the PEM private
+       key block, which needs its ``BEGIN``/``END`` markers in one string
+       — cannot see across a per-line call, so pass 1 leaves a whole
+       private key in the clear. The blob pass still matches through the
+       ``+`` prefixes, so it recovers those. (Regression: TJS-230.)
+
+    Both run BEFORE truncation: truncating first could cut a PEM's ``END``
+    marker and defeat pass 2.
+
+    ``force=True`` because an approval card is a screenshottable egress
+    boundary that must redact even when the user disabled logging
+    redaction; ``redact_url_credentials=True`` for the same reason. NOT
+    ``file_read``/``code_file`` — those SKIP the ENV/JSON rules, which is
+    precisely backwards here (verified: they re-expose ``api_key:`` values
+    this path must mask).
+    """
+    per_line = []
+    for line in lines:
+        marker, rest = ((line[0], line[1:]) if line[:1] in ("+", "-", " ")
+                        else ("", line))
+        per_line.append(marker + redact_sensitive_text(
+            rest, force=True, redact_url_credentials=True))
+    return redact_sensitive_text(
+        "\n".join(per_line), force=True, redact_url_credentials=True)
+
+
+def _summarize_diff_lines(diff_lines: list[str]) -> str:
+    """``+N/-M lines`` counted from unified-diff body lines."""
+    added = sum(1 for ln in diff_lines
+                if ln.startswith("+") and not ln.startswith("+++"))
+    removed = sum(1 for ln in diff_lines
+                  if ln.startswith("-") and not ln.startswith("---"))
+    return f"+{added}/-{removed} lines"
+
+
+class _PreviewFailed:
+    """Sentinel: preview construction RAISED (TJS-258).
+
+    Distinct from ``None``, which means "there is legitimately nothing worth
+    showing" (an empty diff). A raised preview means the card would render a
+    bare ``<write to X>`` placeholder while the user believes they are
+    reviewing a change — the approval they give is then weaker than the one
+    the gate asked for. Gates treat this sentinel as fail-closed.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:  # never mistaken for a usable preview
+        return False
+
+
+PREVIEW_FAILED = _PreviewFailed()
+
+
+def _build_write_preview(
+        paths: list[str], task_id: str = "default", *,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        patch: str | None = None) -> "_WritePreview | _PreviewFailed | None":
+    """Build the diff preview an approval card should display.
+
+    Handles the three shapes the write/patch tools take: a whole-file
+    ``content`` write (diffed against the file on disk), a V4A ``patch``
+    (already a diff — shown as-is), and a replace-mode
+    ``old_string``/``new_string`` edit (diffed as a snippet, since the
+    surrounding file is unchanged).
+
+    Returns ``None`` when there is nothing useful to show (callers fall
+    back to the target-name placeholder), or ``PREVIEW_FAILED`` when
+    construction raised.
+
+    NEVER raises: this runs before a security gate. But it no longer
+    degrades silently either (TJS-258) — a failure is reported as
+    ``PREVIEW_FAILED`` so the gate can block rather than ask the user to
+    approve a change it cannot show them.
+    """
+    try:
+        return _build_write_preview_inner(
+            paths, task_id, content=content, old_string=old_string,
+            new_string=new_string, replace_all=replace_all, patch=patch)
+    except Exception:
+        logger.warning(
+            "Approval-card diff preview failed; the approval gate will fail "
+            "closed rather than show a placeholder", exc_info=True)
+        return PREVIEW_FAILED
+
+
+def _build_write_preview_inner(
+        paths: list[str], task_id: str = "default", *,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        patch: str | None = None) -> "_WritePreview | None":
+    """Preview construction proper. See ``_build_write_preview``."""
+    import difflib
+
+    scope = ""
+    if patch:
+        body = patch.splitlines()
+        label = "V4A patch"
+    elif content is not None and len(paths) == 1:
+        target = paths[0]
+        body = list(difflib.unified_diff(
+            _current_file_text(target, task_id).splitlines(),
+            content.splitlines(),
+            fromfile=f"a/{target}", tofile=f"b/{target}", lineterm=""))
+        label = os.path.basename(target) or target
+    elif old_string is not None and new_string is not None:
+        target = paths[0] if paths else "<file>"
+        body = list(difflib.unified_diff(
+            old_string.splitlines(), new_string.splitlines(),
+            fromfile=f"a/{target}", tofile=f"b/{target}", lineterm=""))
+        label = os.path.basename(target) or target
+        # Snippet-level: the rest of the file is untouched. Under
+        # ``replace_all`` this ONE snippet stands in for every occurrence,
+        # so say how many or the card understates the change.
+        if replace_all:
+            hits = _current_file_text(target, task_id).count(old_string) \
+                if old_string else 0
+            scope = (f", applied to all {hits} occurrences"
+                     if hits != 1 else ", applied to 1 occurrence")
+        else:
+            scope = ", one occurrence (rest of file unchanged)"
+    else:
+        return None
+
+    if not body:
+        return None
+
+    counts = _summarize_diff_lines(body)
+    text = _redact_diff_text(body)
+    truncated = len(text) > _WRITE_PREVIEW_BUDGET
+    if truncated:
+        text = text[:_WRITE_PREVIEW_BUDGET] + "\n... [truncated]"
+    # A diff can legitimately contain ``` (editing a markdown file), which
+    # would close the card's fence early and dump the rest as chat text.
+    text = text.replace("```", "`​`​`")
+
+    summary = f"{counts}{scope}" + (" (preview truncated)" if truncated else "")
+    # Lead with the summary: adapters truncate the fenced block at wildly
+    # different budgets (WhatsApp at 800), so the file name and change size
+    # must come FIRST to be guaranteed to survive.
+    return _WritePreview(diff=f"{label}: {summary}\n{text}", summary=summary)
+
+
+def _write_request_identity(
+        paths: list[str], task_id: str = "default", *,
+        mode: str,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+        states: list[str] | None = None,
+        patch: str | None = None) -> str | None:
+    """Canonical identity of the write REQUEST the user is being asked about.
+
+    TJS-258. This is the authorization key for a released "once" grant, and
+    it is built from the *inputs* — never from a preview, a card string or a
+    redacted diff. Every identity defect found in the five TJS-256 review
+    rounds came from keying on a presentation artifact:
+
+    * the card's ``command`` text  → two secrets differing only inside the
+      masked span render identically, so one grant authorized the other;
+    * the redacted diff preview    → same collision, on the protected-write
+      path that motivated the work;
+    * the preview's snippet diff   → ``replace_all=True`` and
+      ``replace_all=False`` produce the SAME diff body, so approving
+      "replace one occurrence" authorized "replace all occurrences"
+      (reproduced end to end through ``patch_tool``).
+
+    The returned string therefore names everything that distinguishes one
+    authorized write from another:
+
+    ``mode``
+        ``write`` / ``replace`` / ``patch``. A whole-file write and an
+        equivalent patch are different decisions and must not share a grant.
+    resolved target path(s) + ``task_id``
+        The real destinations, resolved through the task's base dir, sorted
+        and deduplicated, so the same relative path under a different task
+        is a different request.
+    source state digests (TJS-259 round 6)
+        The current bytes of every path the request touches. A user approves
+        a *change*, not a request in the abstract, and a released grant has
+        no expiry: editing the target (or a V4A Move's source) while the card
+        waits otherwise reproduces the same request identity and redeems the
+        grant against a state that was never shown. Both were reproduced live
+        before this component existed.
+    ``replace_all`` and occurrence scope
+        How many occurrences the approval covers. The count is read from the
+        file the user is deciding about; when it cannot be read the scope is
+        recorded as ``?`` (unknown), which still differs from any number and
+        so still forces a fresh card rather than silently widening.
+    content digests
+        SHA-256 of ``content`` / ``old_string`` / ``new_string`` / ``patch``.
+        Digests, not text: the grant outlives the turn and the raw inputs can
+        hold credentials. The digest is exact for comparison and reveals
+        nothing, and this string never reaches a card payload — it is hashed
+        again by ``_operation_fingerprint`` together with the warning set.
+
+    Returns ``None`` only when the request shape is unrecognizable. Callers
+    MUST fail closed on ``None`` rather than fall back to a weaker key.
+    """
+    def _d(value: str | None) -> str:
+        if value is None:
+            return "-"
+        return hashlib.sha256(
+            value.encode("utf-8", "surrogatepass")).hexdigest()
+
+    if mode not in ("write", "replace", "patch"):
+        return None
+
+    targets = _resolve_write_targets(paths, task_id)
+    if not targets:
+        return None
+    if states is None:
+        states = _capture_path_states(targets, task_id)
+    if any(s == _STATE_UNREADABLE for s in states):
+        # Never build an identity out of an unreadable state: the sentinel is
+        # a stable literal and would MATCH ITSELF, so two different unreadable
+        # states would share a grant (TJS-259 round 7, defect 2). Callers fail
+        # closed on None; `_unverifiable_state_error` gives the user a reason.
+        return None
+
+    # Occurrence scope only means something for a replace.
+    scope = "-"
+    if mode == "replace" and old_string:
+        try:
+            scope = str(_current_file_text(targets[0], task_id).count(old_string))
+        except Exception:
+            # Was "?" — a stable literal, so two requests against two
+            # different unreadable preimages shared one identity. That is
+            # round 7's defect 2 in a second place. No preimage means no
+            # occurrence count, which means no honest identity: fail closed
+            # exactly as an unreadable state does.
+            return None
+
+    return "\x1f".join([
+        "hermes.write-request.v2",
+        f"mode={mode}",
+        f"task={task_id}",
+        "targets=" + "\x1e".join(targets),
+        # TJS-259 round 6: the state each touched path is in RIGHT NOW. The
+        # user approved a change against this state; if it moves while the
+        # released card waits, the resumed call must not redeem the grant.
+        # Covers both reproduced defects — the whole-file preimage and the
+        # V4A Move source — because `paths` already carries every endpoint.
+        "states=" + "\x1e".join(states),
+        f"replace_all={bool(replace_all)}",
+        f"occurrences={scope}",
+        f"content={_d(content)}",
+        f"old={_d(old_string)}",
+        f"new={_d(new_string)}",
+        f"patch={_d(patch)}",
+    ])
+
+
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        reasons: list[str], task_id: str = "default",
+        preview: "_WritePreview | _PreviewFailed | None" = None,
+        identity: str | None = None) -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -849,14 +1753,39 @@ def _request_protected_instruction_approval(
     honors --yolo and session/permanent allowlists, and the entire point
     here is one-operation approval EVERY time, with no persistent scope
     and no yolo bypass. Fail-closed when no human channel exists.
+
+    ``identity`` (TJS-258) is the write-request identity from
+    ``_write_request_identity``. It is REQUIRED on the gateway path: a
+    released "once" grant is keyed on it, so a missing identity would have
+    to fall back to something weaker than the decision the user reviewed.
+    We block instead — see the fail-closed branch below.
     """
     targets = ", ".join(dict.fromkeys(reasons))
+    if isinstance(preview, _PreviewFailed):
+        # TJS-258: the card would show a bare placeholder while the user
+        # believes they are reviewing a change. Do not ask for an approval
+        # weaker than the one this gate needs.
+        logger.error(
+            "Protected-write approval preview failed for %s — blocking "
+            "rather than asking the user to approve a change the card "
+            "cannot show", targets)
+        return (
+            f"BLOCKED: write to protected agent-instruction file(s) "
+            f"({targets}) requires approval but the change could not be "
+            "rendered for review, so it was not shown to the user. Do NOT "
+            "retry it or attempt the same edit via another path."
+        )
     description = (
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )
-    display = f"<write to {targets}>"
+    if preview is not None:
+        description += f" Change: {preview.summary}."
+    # The card renders this in its fenced code block (``_format_exec_approval``
+    # in gateway/platforms/base.py), so putting the diff here surfaces the
+    # actual change on every platform without any adapter-side change.
+    display = preview.diff if preview is not None else f"<write to {targets}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
@@ -882,6 +1811,24 @@ def _request_protected_instruction_approval(
         notify_cb = None
 
     if notify_cb is not None:
+        # TJS-258: fail closed when the write-request identity is missing.
+        # A released "once" grant is keyed on it; without it the only
+        # available key would be weaker than the decision the user is about
+        # to make (target-only), which is precisely the degradation the
+        # TJS-256 review rounds kept finding. Refusing to raise a card the
+        # answer cannot safely bind to is the conservative outcome.
+        if not identity:
+            logger.error(
+                "Protected-write approval could not build a write-request "
+                "identity for %s — blocking rather than raising a card whose "
+                "'once' answer would bind to a weaker key", targets,
+            )
+            return blocked.format(
+                why="requires approval but the exact write could not be "
+                    "identified, so an approval could not be bound to it.")
+        # NOTE (TJS-256): the released "once" grant for this write is
+        # redeemed centrally inside _await_gateway_decision(). Do not redeem
+        # it here as well — that would consume the grant twice.
         approval_data = {
             "command": display,
             "pattern_key": "protected_instruction_file",
@@ -892,11 +1839,34 @@ def _request_protected_instruction_approval(
         }
         decision = _approval._await_gateway_decision(
             session_key, notify_cb, approval_data, surface="gateway",
+            # TJS-258: identity comes from the write REQUEST (mode, resolved
+            # targets, replace_all, occurrence scope, input digests), never
+            # from `display` — that is the redacted preview, which collides
+            # across different secrets AND across replace_all=True/False.
+            raw_operation=identity,
         )
         if decision.get("notify_failed"):
             return blocked.format(
                 why="requires approval but the approval request could not "
                     "be delivered.")
+        if decision.get("released"):
+            # TJS-226: card is live and unanswered; the agent thread was
+            # released instead of parked. Not a denial — say so precisely,
+            # or the model reports a refusal the user never made.
+            return (
+                f"PENDING APPROVAL: the write to protected agent-instruction "
+                f"file(s) ({targets}) needs the user's approval. The card has "
+                "been sent, does NOT expire, and is still unanswered. Your "
+                "run was released rather than left waiting, and will be "
+                "resumed automatically with the decision whenever the user "
+                "answers — possibly hours from now.\n\n"
+                "Do NOT retry this write and do NOT attempt it via another "
+                "path (terminal, execute_code, patch) — each attempt sends "
+                "another card.\n\n"
+                "You are free to carry on with any OTHER work that does not "
+                "depend on this write. If nothing else is left, end your turn "
+                "and report that approval is pending."
+            )
         choice = decision.get("choice")
         if decision.get("resolved") and choice in {"once", "session", "always"}:
             # One-operation grant regardless of the tapped scope — nothing
@@ -939,8 +1909,11 @@ def _request_protected_instruction_approval(
             "present to approve it.")
 
 
-def _check_protected_instruction_write(paths: list[str],
-                                       task_id: str = "default") -> str | None:
+def _check_protected_instruction_write(
+        paths: list[str], task_id: str = "default",
+        preview: "_WritePreview | _PreviewFailed | None" = None,
+        identity: str | None = None,
+        realpaths: "dict[str, str] | None" = None) -> str | None:
     """Gate a write/patch touching protected instruction files.
 
     Returns ``None`` when no target is protected or the human approved;
@@ -949,6 +1922,11 @@ def _check_protected_instruction_write(paths: list[str],
     protected target, and a deny applies nothing (including innocent
     files) — partial application of an approved-in-part patch would be
     more surprising than an atomic all-or-nothing outcome.
+
+    ``identity`` (TJS-258) is the write-request identity a released "once"
+    answer is bound to; see ``_write_request_identity``. ``realpaths``
+    (TJS-259 round 10) is the ONE plan's realpath per raw path, so this gate
+    decides about exactly the file the write will touch.
     """
     enabled, extra = _protected_instruction_config()
     if not enabled:
@@ -956,16 +1934,21 @@ def _check_protected_instruction_write(paths: list[str],
     reasons: list[str] = []
     for p in paths:
         reason = _protected_instruction_reason(
-            p, task_id, enabled=enabled, extra_patterns=extra)
+            p, task_id, enabled=enabled, extra_patterns=extra,
+            resolved=(realpaths or {}).get(p))
         if reason:
             reasons.append(reason)
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(
+        reasons, task_id, preview, identity)
 
 
-def _check_approval_required_write(paths: list[str],
-                                   task_id: str = "default") -> str | None:
+def _check_approval_required_write(
+        paths: list[str], task_id: str = "default",
+        preview: "_WritePreview | _PreviewFailed | None" = None,
+        identity: str | None = None,
+        realpaths: "dict[str, str] | None" = None) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config``).
 
     These paths are NOT credentials and NOT hard-denied, but a write must
@@ -985,16 +1968,31 @@ def _check_approval_required_write(paths: list[str],
     except Exception:
         return None
 
-    targets = [p for p in paths if is_write_approval_required(p)]
+    targets = [p for p in paths
+               if is_write_approval_required(p, (realpaths or {}).get(p))]
     if not targets:
         return None
 
     display_targets = ", ".join(dict.fromkeys(targets))
+    if isinstance(preview, _PreviewFailed):
+        # TJS-258: same rule as the protected-write gate.
+        logger.error(
+            "SSH-config write approval preview failed for %s — blocking "
+            "rather than asking the user to approve an unshown change",
+            display_targets)
+        return (
+            f"BLOCKED: write to SSH config file(s) ({display_targets}) "
+            "requires approval but the change could not be rendered for "
+            "review, so it was not shown to the user. Do NOT retry it via "
+            "another path."
+        )
     description = (
         f"Write to SSH client config file(s): {display_targets}. "
         "The SSH config can carry ProxyCommand / Match exec directives that "
         "run commands, so writes require your approval."
     )
+    if preview is not None:
+        description += f" Change: {preview.summary}."
     blocked = (
         f"BLOCKED: write to SSH config file(s) ({display_targets}) "
         "{why} Do NOT retry it via another path (terminal, execute_code) "
@@ -1010,7 +2008,14 @@ def _check_approval_required_write(paths: list[str],
     result = _approval._run_approval_gate(
         pattern_key="ssh_config_write",
         description=description,
-        display_target=f"<write to {display_targets}>",
+        display_target=(preview.diff if preview is not None
+                        else f"<write to {display_targets}>"),
+        # TJS-258: same rule as the protected-write gate — a released "once"
+        # grant binds to the write REQUEST, not to the displayed preview.
+        # ``None`` makes the gate fail closed rather than fall back to the
+        # (redacted, colliding) display string.
+        raw_operation=identity,
+        require_raw_operation=True,
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
         single_query_deny_message=blocked.format(
@@ -2248,12 +3253,53 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
-    protected_err = _check_protected_instruction_write([path], task_id)
-    if protected_err:
-        return tool_error(protected_err)
-    approval_err = _check_approval_required_write([path], task_id)
-    if approval_err:
-        return tool_error(approval_err)
+    # ONE immutable resolved-path plan, built before anything reads or
+    # decides (TJS-259 round 9, defect 1). Round 8 gave patch_tool this shape
+    # but left write_file resolving twice: once for the authorization identity
+    # and again after both gates, then locking, drift-checking and writing
+    # THAT second result. Retarget a symlinked AGENTS.md in between and the
+    # reviewed file was untouched while an unreviewed one was overwritten, on
+    # the original card. Resolution happens here and nowhere else in this
+    # function; authorization, locking, drift, mutation and the reported path
+    # all read this plan.
+    try:
+        _resolved = str(_resolve_path_for_task(path, task_id))
+    except Exception:
+        _resolved = None
+    _plan: dict[str, str | None] = {path: _resolved}
+    # Realpaths from that SAME plan, so the gate DECISION is about the file
+    # the write will touch (TJS-259 round 10).
+    _realpaths = _plan_realpaths([path], _plan, task_id)
+
+    # TJS-259 round 7 defect 4: only pay for the preview + state hashing when
+    # a gate actually exists to consume them. An ungated write used to hash
+    # every touched path (1.178s on a 1 GiB file).
+    _gated = _write_gate_applies([path], task_id, realpaths=_realpaths)
+    _approved_targets: list[str] = []
+    _approved_states: list[str] = []
+    if _gated:
+        # Built once and shared by both gates so the approval card shows the
+        # actual change rather than only the target's name. PRESENTATION ONLY.
+        _preview = _build_write_preview([path], task_id, content=content)
+        # TJS-258: authorization identity, built from the REQUEST — independent
+        # of the preview, so a preview failure cannot weaken it.
+        _approved_targets = _resolve_write_targets([path], task_id, plan=_plan)
+        _approved_states = _capture_path_states(_approved_targets, task_id)
+        _unverifiable = _unverifiable_state_error(
+            _approved_targets, _approved_states)
+        if _unverifiable:
+            return tool_error(_unverifiable)
+        _identity = _write_request_identity(
+            [path], task_id, mode="write", content=content,
+            states=_approved_states)
+        protected_err = _check_protected_instruction_write(
+            [path], task_id, _preview, _identity, realpaths=_realpaths)
+        if protected_err:
+            return tool_error(protected_err)
+        approval_err = _check_approval_required_write(
+            [path], task_id, _preview, _identity, realpaths=_realpaths)
+        if approval_err:
+            return tool_error(approval_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -2265,15 +3311,22 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "file contents before writing."
         )
     try:
-        # Resolve once for the registry lock + stale check.  Failures here
-        # fall back to the legacy path — write proceeds, per-task staleness
+        # No resolution here: ``_resolved`` comes from the ONE plan built
+        # above, before the gates ran. A failure to resolve there falls back
+        # to the legacy path — the write proceeds and the per-task staleness
         # check below still runs.
-        try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
-        except Exception:
-            _resolved = None
-
         if _resolved is None:
+            if _gated:
+                # A gated write whose target could not be resolved has no
+                # plan to authorize, lock or write against, and the legacy
+                # fallback below hands the RAW path to the backend, which
+                # resolves it again itself — exactly the second resolution
+                # this round removes. Fail closed instead (round 9).
+                return tool_error(
+                    f"BLOCKED: could not resolve '{path}' to a single target, "
+                    "so an approval cannot be bound to the file that would be "
+                    "written. Use an absolute path and retry."
+                )
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
@@ -2289,6 +3342,16 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # TJS-259 round 7 defect 3: the gate decided BEFORE this lock, so
+            # a concurrent subagent could have changed the file in between.
+            # The lock exists to serialize exactly those writers, so the
+            # authorized state is re-verified here, inside it, and the write
+            # is abandoned on any difference.
+            if _approved_targets:
+                _drift = _state_drift_error(
+                    _approved_targets, _approved_states, task_id)
+                if _drift:
+                    return tool_error(_drift)
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -2397,25 +3460,89 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
             return tool_error(binary_doc_err)
+    # TJS-259 round 8 defect 1: ONE immutable resolved-path plan, built here
+    # and used for authorization, locking and mutation alike. Resolving the
+    # raw paths again after the locks were held made the written path a
+    # different file from the reviewed and locked one: retarget a symlinked
+    # AGENTS.md while the card waits, and the code locked/revalidated the
+    # original target while the later re-resolution rewrote the V4A header to
+    # the new one — the unreviewed file was written with no fresh card.
+    # Resolving once removes the second resolution that could disagree.
+    _path_to_resolved: dict[str, str | None] = {}
+    for _p in _paths_to_check:
+        try:
+            _path_to_resolved[_p] = str(_resolve_path_for_task(_p, task_id))
+        except Exception:
+            _path_to_resolved[_p] = None
+
+    # Realpaths from that SAME plan, so the gate DECISION is about the files
+    # the patch will touch (TJS-259 round 10).
+    _realpaths = _plan_realpaths(_paths_to_check, _path_to_resolved, task_id)
+
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
-    protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
-    if protected_err:
-        return tool_error(protected_err)
-    approval_err = _check_approval_required_write(_paths_to_check, task_id)
-    if approval_err:
-        return tool_error(approval_err)
+    # TJS-259 round 7 defect 4: skipped entirely when no gate applies, so an
+    # ordinary V4A Delete/Move of a large file stays metadata-bound.
+    _gated = _write_gate_applies(_paths_to_check, task_id,
+                                 realpaths=_realpaths)
+    if _gated:
+        # Same fail-closed rule as write_file (round 9): an unresolvable path
+        # in a gated request has no plan to authorize or lock, and both the
+        # replace target and the V4A header rewrite fall back to the RAW path,
+        # which the backend then resolves for itself — a second resolution by
+        # another name.
+        _unplanned = [_p for _p, _r in _path_to_resolved.items() if not _r]
+        if _unplanned:
+            return tool_error(
+                f"BLOCKED: could not resolve {', '.join(_unplanned)} to a "
+                "single target, so an approval cannot be bound to the file(s) "
+                "that would be written. Use absolute paths and retry."
+            )
+    _approved_targets: list[str] = []
+    _approved_states: list[str] = []
+    if _gated:
+        _preview = _build_write_preview(
+            _paths_to_check, task_id,
+            old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
+            patch=patch if mode == "patch" else None)
+        # TJS-258: identity from the REQUEST. ``replace_all`` and the occurrence
+        # count are part of it — the snippet diff is identical for
+        # replace_all=True and False, so a preview-derived key let a
+        # one-occurrence approval authorize rewriting every occurrence.
+        _approved_targets = _resolve_write_targets(
+            _paths_to_check, task_id, plan=_path_to_resolved)
+        _approved_states = _capture_path_states(_approved_targets, task_id)
+        _unverifiable = _unverifiable_state_error(
+            _approved_targets, _approved_states)
+        if _unverifiable:
+            return tool_error(_unverifiable)
+        _identity = _write_request_identity(
+            _paths_to_check, task_id,
+            mode="patch" if mode == "patch" else "replace",
+            old_string=old_string, new_string=new_string,
+            replace_all=replace_all,
+            states=_approved_states,
+            patch=patch if mode == "patch" else None)
+        protected_err = _check_protected_instruction_write(
+            _paths_to_check, task_id, _preview, _identity,
+            realpaths=_realpaths)
+        if protected_err:
+            return tool_error(protected_err)
+        approval_err = _check_approval_required_write(
+            _paths_to_check, task_id, _preview, _identity,
+            realpaths=_realpaths)
+        if approval_err:
+            return tool_error(approval_err)
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
-        # multi-file V4A patches.
+        # Lock ordering comes from the SAME plan built above — never a fresh
+        # resolution (TJS-259 round 8 defect 1). Ordered + deduplicated so
+        # concurrent callers lock in the same order, preventing deadlock on
+        # overlapping multi-file V4A patches.
         _resolved_paths: list[str] = []
         _seen: set[str] = set()
         for _p in _paths_to_check:
-            try:
-                _r = str(_resolve_path_for_task(_p, task_id))
-            except Exception:
-                _r = None
+            _r = _path_to_resolved.get(_p)
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
                 _seen.add(_r)
@@ -2429,16 +3556,23 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _r in _resolved_paths:
                 _locks.enter_context(file_state.lock_path(_r))
 
+            # TJS-259 round 7 defect 3: re-verify the authorized state now
+            # that every path is locked. The gate ran before these locks, so
+            # a concurrent subagent could have moved the file underneath the
+            # decision. All-or-nothing, matching the gate's own semantics.
+            if _approved_targets:
+                _drift = _state_drift_error(
+                    _approved_targets, _approved_states, task_id)
+                if _drift:
+                    return tool_error(_drift)
+
             # Collect warnings — cross-agent registry first (names sibling),
-            # then per-task tracker as a fallback.
+            # then per-task tracker as a fallback. Uses the ONE plan; the
+            # second resolution that used to happen here is what let the
+            # written path drift away from the reviewed and locked one.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
+                _r = _path_to_resolved.get(_p)
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:

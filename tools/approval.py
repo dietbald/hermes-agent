@@ -23,7 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import Any, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -2538,6 +2538,16 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
+# TJS-226/TJS-256: single-use grants from released cards answered "once".
+# session_key → list of pending grant records, each bound to the EXACT
+# operation the user reviewed (the command string shown on the card) and
+# redeemed at most once. A list, not a set: two independent same-pattern
+# "once" answers are two grants and must not collapse into one.
+_released_once_grants: dict[str, list] = {}
+# Process-lifetime salt for operation fingerprints. Random per process so a
+# stored digest is not a stable, offline-guessable handle for the raw command
+# it was derived from (grants live only in this process anyway).
+_OPERATION_FINGERPRINT_SALT = os.urandom(16)
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
@@ -2783,7 +2793,8 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged",
+                 "released", "fingerprint")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2791,6 +2802,14 @@ class _ApprovalEntry:
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        # True when the agent thread returned instead of parking on
+        # ``event.wait()`` (TJS-226). The answer must then be delivered by the
+        # session's wake callback rather than by unblocking a waiter.
+        self.released = False
+        # TJS-256: identity of the operation this card authorizes, used to
+        # redeem a released "once" grant. Never part of `data`, so it is
+        # never rendered to a platform or replayed to a client.
+        self.fingerprint: str = ""
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
@@ -2799,6 +2818,53 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# session_key → callable(approval_data: dict, decision: dict) -> None
+# Registered alongside the notify callback by a gateway that can push a NEW
+# turn into the session after the current one ended (TJS-226). Its presence is
+# what makes releasing the agent thread safe: without a way to resume, an
+# early return would silently drop the user's answer on the floor.
+_gateway_wake_cbs: dict[str, Any] = {}
+
+
+def register_gateway_wake(session_key: str, cb) -> None:
+    """Register a per-session callback that resumes the run after an answer.
+
+    Signature ``cb(approval_data: dict, decision: dict) -> None``. Called from
+    :func:`resolve_gateway_approval` when the resolved entry was raised in
+    release mode (the agent thread already returned). The callback is
+    responsible for delivering a wake turn to the session — see
+    ``gateway.wake.deliver_wake``.
+    """
+    with _lock:
+        _gateway_wake_cbs[session_key] = cb
+
+
+def unregister_gateway_wake(session_key: str) -> None:
+    """Drop the wake callback for a session (end of turn / shutdown)."""
+    with _lock:
+        _gateway_wake_cbs.pop(session_key, None)
+
+
+def _thread_release_enabled() -> bool:
+    """True when approvals may release the agent thread instead of parking it.
+
+    ``approvals.release_thread`` in config.yaml. Defaults to False so the
+    fleet keeps today's blocking behaviour until this is switched on
+    deliberately (TJS-226). Even when True, releasing only happens where a
+    wake callback is registered for the session.
+    """
+    try:
+        return bool(_get_approval_config().get("release_thread", False))
+    except Exception:
+        return False
+
+
+def _can_release_thread(session_key: str) -> bool:
+    """True when this session can be released AND resumed."""
+    if not _thread_release_enabled():
+        return False
+    with _lock:
+        return _gateway_wake_cbs.get(session_key) is not None
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2822,8 +2888,18 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        # TJS-226: a RELEASED entry has no waiter to unblock and must outlive
+        # the turn that raised it — that is the whole point of releasing the
+        # thread. Turn teardown runs in the agent's finally block, long before
+        # the human taps, so dropping released entries here would destroy the
+        # card and make the later tap resolve nothing (no wake, run parked
+        # forever). Keep them queued; only blocked waiters are signalled.
+        survivors = [e for e in entries if getattr(e, "released", False)]
+        if survivors:
+            _gateway_queues[session_key] = survivors
     for entry in entries:
-        entry.event.set()
+        if not getattr(entry, "released", False):
+            entry.event.set()
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2865,6 +2941,87 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if reason:
             entry.reason = reason
         entry.event.set()
+        # Released entries have no waiter to unblock — the agent thread
+        # already returned (TJS-226). Resume the run by pushing a new turn
+        # carrying the decision. Failures are logged, never raised: the
+        # caller is a platform button handler and must still answer the user.
+        if entry.released:
+            # TJS-226: the caller that raised this card already returned, so
+            # the normal caller-side persistence of a session/always grant
+            # never runs. Apply it here, or the wake turn retries the action
+            # and is prompted all over again — the exact re-ask loop TJS-222
+            # is about.
+            #
+            # TJS-256: mirror the caller-side scope rules exactly. The card
+            # itself declares what scopes it may be answered with
+            # (allow_session / allow_permanent), and Tirith keys are
+            # deliberately session-only even on "always" — the blocking path
+            # at check_all_command_guards() never puts a tirith:* key in the
+            # permanent allowlist, and neither may we. A resolver that is not
+            # the button UI can supply any string, so clamp here rather than
+            # trusting the choice.
+            _keys = entry.data.get("pattern_keys") or []
+            if not _keys and entry.data.get("pattern_key"):
+                _keys = [entry.data["pattern_key"]]
+            _allow_session = entry.data.get("allow_session", True)
+            _allow_permanent = entry.data.get("allow_permanent", True)
+            _effective = choice
+            if _effective == "always" and not _allow_permanent:
+                _effective = "session" if _allow_session else "once"
+            if _effective == "session" and not _allow_session:
+                _effective = "once"
+
+            if _effective == "session":
+                for _k in _keys:
+                    approve_session(session_key, _k)
+            elif _effective == "once":
+                grant_released_once(
+                    session_key,
+                    getattr(entry, "fingerprint", "") or "",
+                    entry.data.get("request_id"),
+                )
+            elif _effective == "always":
+                _persisted = False
+                for _k in _keys:
+                    # Tirith rules stay session-scoped forever (parity with
+                    # check_all_command_guards); only dangerous-pattern keys
+                    # may reach the permanent allowlist.
+                    approve_session(session_key, _k)
+                    if not str(_k).startswith("tirith:"):
+                        approve_permanent(_k)
+                        _persisted = True
+                if _persisted:
+                    try:
+                        save_permanent_allowlist(_permanent_approved)
+                    except Exception:
+                        logger.error(
+                            "Failed to persist permanent allowlist after a "
+                            "released approval was answered 'always' "
+                            "(session %s)", session_key, exc_info=True,
+                        )
+            with _lock:
+                wake_cb = _gateway_wake_cbs.get(session_key)
+            if wake_cb is None:
+                logger.error(
+                    "Approval %s for session %s was released but no wake "
+                    "callback is registered — the user's answer (%s) cannot "
+                    "resume the run",
+                    entry.data.get("request_id"), session_key, choice,
+                )
+                continue
+            try:
+                wake_cb(dict(entry.data), {
+                    "resolved": True,
+                    "choice": choice,
+                    "reason": entry.reason,
+                })
+            except Exception:
+                logger.error(
+                    "Approval wake callback failed for session %s "
+                    "(request %s, choice %s)",
+                    session_key, entry.data.get("request_id"), choice,
+                    exc_info=True,
+                )
     return len(targets)
 
 
@@ -2962,12 +3119,22 @@ def clear_session(session_key: str) -> None:
         return
     with _lock:
         _session_approved.pop(session_key, None)
+        _released_once_grants.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        _gateway_wake_cbs.pop(session_key, None)
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
+        #
+        # TJS-226: a RELEASED entry has no blocked waiter to unwind — nothing
+        # is idling. Firing the wake callback here would push a fabricated
+        # "denied" turn into a session the user is deliberately resetting
+        # (/new, /stop), so drop it silently instead. The card itself is
+        # cancelled by dropping the queue above.
+        if getattr(entry, "released", False):
+            continue
         entry.result = "deny"
         entry.event.set()
     _release_permission_mode_dependents(session_key)
@@ -2991,6 +3158,12 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
 
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
+
+    NOTE (TJS-256): released "once" grants are deliberately NOT consulted
+    here. They authorize one exact operation, not a pattern, so redeeming
+    them belongs at the approval gate (_redeem_released_once) where the
+    command being attempted is known. Consulting them here would let any
+    later command sharing the pattern consume the user's grant.
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
@@ -2998,6 +3171,68 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
             return True
         session_approvals = _session_approved.get(session_key, set())
         return any(alias in session_approvals for alias in aliases)
+
+
+def _operation_fingerprint(raw_operation: str, pattern_keys) -> str:
+    """Non-reversible identity for one approvable operation (TJS-256).
+
+    Binds the RAW operation text (never the redacted card string) to the set
+    of warnings it was approved under. Two reasons this is a hash and not the
+    text itself:
+
+    * Card payloads are redacted for display, and two different raw commands
+      whose secrets differ only inside the masked span render identically —
+      so displayed text is not identity. The raw text is.
+    * The raw text contains those secrets, and grants outlive the turn, so
+      storing it verbatim would park credentials in module state. A salted
+      digest keeps the comparison exact without retaining the secret.
+
+    The pattern-key set is part of the identity: if the resumed attempt
+    trips a different or additional rule, it is not the operation the user
+    reviewed and must raise a fresh card.
+    """
+    keys = sorted({str(k) for k in (pattern_keys or []) if k})
+    payload = "\x00".join([raw_operation or ""] + keys).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(_OPERATION_FINGERPRINT_SALT + payload).hexdigest()
+
+
+def grant_released_once(session_key: str, fingerprint: str,
+                        request_id: Optional[str] = None) -> None:
+    """Record a single-use grant for a released approval answered "once".
+
+    Bound to *fingerprint* (raw operation + warning set) so the resumed
+    turn's retry of THAT operation under THOSE warnings is authorized and
+    nothing else is. Appended, never merged: two "once" answers are two
+    grants.
+    """
+    if not fingerprint:
+        return
+    with _lock:
+        _released_once_grants.setdefault(session_key, []).append({
+            "fingerprint": fingerprint,
+            "request_id": request_id,
+        })
+
+
+def _redeem_released_once(session_key: str, fingerprint: str) -> bool:
+    """Consume a released "once" grant matching this exact operation.
+
+    Returns True when the resumed turn is re-attempting the very operation
+    the user approved, under the same warnings. Redeemed at most once.
+    """
+    if not fingerprint:
+        return False
+    with _lock:
+        grants = _released_once_grants.get(session_key)
+        if not grants:
+            return False
+        for i, grant in enumerate(grants):
+            if grant.get("fingerprint") == fingerprint:
+                grants.pop(i)
+                if not grants:
+                    _released_once_grants.pop(session_key, None)
+                return True
+    return False
 
 
 def approve_permanent(pattern_key: str):
@@ -3686,6 +3921,8 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    raw_operation: Optional[str] = None,
+    require_raw_operation: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3724,6 +3961,16 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        raw_operation: Identity of the operation for a released "once"
+            grant (TJS-256/258). MUST be derived from the request inputs,
+            never from ``display_target`` — that string is redacted for the
+            card and collides across different operations. When ``None`` the
+            gate falls back to ``display_target`` (historical command-path
+            behaviour, where the display string IS the raw command).
+        require_raw_operation: When True, a missing ``raw_operation`` on the
+            gateway path BLOCKS instead of falling back. File-write callers
+            set this: their ``display_target`` is a redacted diff preview and
+            binding a grant to it is exactly the defect class TJS-258 fixes.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3821,6 +4068,31 @@ def _run_approval_gate(
             notify_cb = _gateway_notify_cbs.get(session_key)
 
         if notify_cb is not None:
+            # TJS-258: a released "once" grant binds to this identity. When
+            # the caller declares the identity mandatory and could not build
+            # one, block instead of raising a card whose answer would bind to
+            # the redacted display string (which collides across different
+            # secrets and across replace_all=True/False).
+            if require_raw_operation and not raw_operation:
+                logger.error(
+                    "%s (pattern: %s): no operation identity available — "
+                    "blocking rather than binding an approval to the "
+                    "redacted display text", autoapprove_log_prefix,
+                    pattern_key,
+                )
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: approval required ({description}) but the "
+                        "exact operation could not be identified, so an "
+                        "approval could not be bound to it. Do NOT retry it "
+                        "via another path."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                    "outcome": "no_identity",
+                    "user_consent": False,
+                }
             from agent.redact import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(display_target),
@@ -3831,7 +4103,13 @@ def _run_approval_gate(
                 "allow_session": True,
             }
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key, notify_cb, approval_data, surface="gateway",
+                # TJS-256/258: approval_data["command"] is redacted for
+                # display; identity must come from the caller's raw operation
+                # (a write-request identity for the file gates, the raw
+                # command text for the command gates).
+                raw_operation=(raw_operation if raw_operation is not None
+                               else display_target),
             )
             if decision.get("notify_failed"):
                 return {
@@ -3842,6 +4120,10 @@ def _run_approval_gate(
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
+            if decision.get("released"):
+                return released_pending_result(
+                    decision, pattern_key=pattern_key, description=description,
+                )
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
@@ -4345,6 +4627,45 @@ def _transport_denied_result(
     }
 
 
+def released_pending_result(decision: dict, *, pattern_key: str = "",
+                            description: str = "") -> dict:
+    """Build the tool-facing result for an approval that released the thread.
+
+    TJS-226. The card is live and unanswered; the run will be resumed by a
+    wake turn when the user taps. This is NOT a denial and NOT a timeout —
+    callers must return this instead of their "timed out without response"
+    branch, or the agent is told the user refused something they never saw.
+
+    The message tells the model to end the turn rather than retry, because a
+    retry would raise a second identical card.
+    """
+    return {
+        "approved": False,
+        "status": "approval_released",
+        "approval_pending": True,
+        "released": True,
+        "request_id": decision.get("request_id"),
+        "pattern_key": pattern_key,
+        "description": description,
+        "user_consent": False,
+        "outcome": "pending",
+        "message": (
+            "PENDING APPROVAL: the user has been sent an approval card for "
+            f"this action ({description or 'see card'}) and has not answered "
+            "yet. The card does NOT expire and your run has been released "
+            "rather than left waiting — you will be resumed automatically "
+            "with the decision whenever the user answers, which may be hours "
+            "from now.\n\n"
+            "Do NOT retry this action, do NOT rephrase it, and do NOT attempt "
+            "the same outcome by another path — each attempt sends the user "
+            "another card. Silence is not consent.\n\n"
+            "You are free to carry on with any OTHER work that does not "
+            "depend on this decision. If nothing else is left to do, end your "
+            "turn and report that approval is pending."
+        ),
+    }
+
+
 def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
                             *, surface: str = "gateway"):
     """Wait on an already-pending identical approval instead of re-prompting.
@@ -4444,7 +4765,9 @@ def _await_coalesced_leader(session_key: str, leader, approval_data: dict,
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            allow_release: bool = True,
+                            raw_operation: Optional[str] = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -4462,6 +4785,30 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+
+    # ── TJS-256: operation identity, computed before anything else ──
+    # Built from the RAW operation (the card's "command" is redacted for
+    # display, and two different raw commands whose secrets differ only
+    # inside the masked span render to the SAME string) plus the warning set
+    # (a retry that trips a different or extra rule is not the operation the
+    # user reviewed). Salted digest: exact comparison, no secret retained.
+    _fingerprint = _operation_fingerprint(
+        raw_operation if raw_operation is not None
+        else (approval_data.get("command") or ""),
+        all_keys if all_keys else ([primary_key] if primary_key else []),
+    )
+    # Redeem a released "once" grant BEFORE coalescing or enqueueing. The
+    # wake turn re-attempts the operation, so without this every released
+    # consumer would raise a SECOND card for a decision the user already
+    # gave. Must precede coalescing, or the retry can instead coalesce onto
+    # an unrelated pending card and never redeem at all.
+    if _redeem_released_once(session_key, _fingerprint):
+        logger.info(
+            "Redeemed released 'once' grant for session %s — resuming the "
+            "approved operation without re-asking", session_key,
+        )
+        return {"resolved": True, "choice": "once", "reason": None,
+                "redeemed_released_once": True}
 
     # ── Coalesce identical concurrent approvals (one prompt, one answer) ──
     # Parallel tool calls (a parallel terminal batch, execute_code RPC
@@ -4482,15 +4829,32 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     leader = None
     with _lock:
         for existing in _gateway_queues.get(session_key, []):
-            data = existing.data
-            if (
-                data.get("command") == approval_data.get("command")
-                and list(data.get("pattern_keys") or [])
-                == list(approval_data.get("pattern_keys") or [])
-            ):
+            # TJS-256: match on the operation fingerprint. The redacted
+            # "command" text is not identity — two different raw operations
+            # can render identically once their secrets are masked, and
+            # coalescing them would let one command inherit another's
+            # answer.
+            if getattr(existing, "fingerprint", "") == _fingerprint:
                 leader = existing
                 break
     if leader is not None:
+        # TJS-226: never park a follower on a released leader — that would
+        # reintroduce the exact blocking wait this change removes. Report the
+        # leader's pending card as released; the wake fired when the leader
+        # resolves carries the answer for this session.
+        if allow_release and getattr(leader, "released", False):
+            logger.info(
+                "Coalesced onto released approval %s for session %s — "
+                "follower thread released too",
+                leader.data.get("request_id"), session_key,
+            )
+            return {
+                "resolved": False,
+                "choice": None,
+                "released": True,
+                "coalesced": True,
+                "request_id": leader.data.get("request_id"),
+            }
         adopted = _await_coalesced_leader(
             session_key, leader, approval_data, surface=surface
         )
@@ -4499,7 +4863,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         # Leader resolved "once" — fall through to a fresh prompt below.
 
     entry = _ApprovalEntry(approval_data)
+    entry.fingerprint = _fingerprint
+    # TJS-226: decide release BEFORE the entry is reachable by a resolver.
+    # notify_cb below hands the card to the platform, and the user can tap
+    # before notify_cb even returns. If entry.released were still False at
+    # that moment, resolve_gateway_approval() would treat it as a blocking
+    # waiter, drop it, and fire no wake — while this function still returns
+    # "released". That loses the answer permanently. Setting the flag under
+    # the same lock that publishes the entry makes release/resolve atomic.
+    _will_release = bool(allow_release and _can_release_thread(session_key))
     with _lock:
+        entry.released = _will_release
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
@@ -4539,6 +4913,31 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             choice="notify_failed",
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
+
+    # ── TJS-226: release the agent thread instead of parking it ──
+    # When the session can be resumed by a wake turn, do NOT sit on
+    # entry.event.wait() for the human's think time. Mark the entry released
+    # and return a distinct "released" decision; resolve_gateway_approval()
+    # will fire the wake callback when the answer lands. The entry stays in
+    # the queue so /approve, the platform buttons and has_blocking_approval()
+    # all keep working unchanged.
+    #
+    # This is what decouples the wait from approvals.timeout: a released
+    # entry has no deadline at all, so raising approvals.timeout to a year
+    # (TJS-222) can no longer park a thread for a year.
+    if _will_release:
+        # entry.released was already set atomically with publication above.
+        logger.info(
+            "Approval %s raised in release mode for session %s — agent "
+            "thread released, run resumes on the answer event",
+            entry.data.get("request_id"), session_key,
+        )
+        return {
+            "resolved": False,
+            "choice": None,
+            "released": True,
+            "request_id": entry.data.get("request_id"),
+        }
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
@@ -5073,7 +5472,10 @@ def check_all_command_guards(command: str, env_type: str,
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key, notify_cb, approval_data, surface="gateway",
+                # TJS-256: approval_data["command"] is redacted for display;
+                # identity must come from the raw text.
+                raw_operation=command,
             )
             if decision.get("notify_failed"):
                 return {
@@ -5084,6 +5486,11 @@ def check_all_command_guards(command: str, env_type: str,
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
+            if decision.get("released"):
+                return released_pending_result(
+                    decision, pattern_key=primary_key,
+                    description=combined_desc,
+                )
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
@@ -5633,7 +6040,9 @@ def check_execute_code_guard(code: str, env_type: str,
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
     decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+        session_key, notify_cb, approval_data, surface="gateway",
+        # TJS-256: card text is redacted; identity comes from the raw code.
+        raw_operation=code,
     )
     if decision.get("notify_failed"):
         return {
@@ -5645,6 +6054,11 @@ def check_execute_code_guard(code: str, env_type: str,
             "outcome": "notify_failed",
             "user_consent": False,
         }
+
+    if decision.get("released"):
+        return released_pending_result(
+            decision, pattern_key=pattern_key, description=description,
+        )
 
     resolved = decision["resolved"]
     choice = decision["choice"]
@@ -5741,6 +6155,13 @@ def request_elicitation_consent(
         try:
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface=surface,
+                # MCP elicitation is a synchronous request/response in the MCP
+                # protocol: the only outcomes are accept/decline/cancel, with
+                # no "pending, resume later" state to return to the server.
+                # Releasing here would be reported to the server as a decline
+                # of a card the user never saw, so this path stays blocking
+                # (TJS-226). It remains bounded by approvals.timeout.
+                allow_release=False,
             )
         except Exception as exc:
             logger.error(

@@ -1009,15 +1009,27 @@ class TestSSHConfigWriteGateSingleQuery:
     approval flow — see issue #93201."""
 
     def test_gate_call_passes_single_query_deny_message(self):
+        import ast as _ast
         import inspect as _inspect
-        import re as _re
         import tools.file_tools as ft
 
-        src = _inspect.getsource(ft)
-        idx = src.find("_approval._run_approval_gate(")
-        assert idx != -1, "ssh_config_write gate call not found"
-        block = src[idx:idx + 900]
-        assert "pattern_key=\"ssh_config_write\"" in block
+        # Find the ssh_config_write gate call by PARSING, not by slicing a
+        # fixed-size source window: a window silently starts missing kwargs
+        # as soon as the call grows (TJS-258 added two), turning this into a
+        # false alarm instead of the regression check it is meant to be.
+        tree = _ast.parse(_inspect.getsource(ft))
+        call = None
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            passed = {kw.arg for kw in node.keywords if kw.arg}
+            pk = next((kw.value for kw in node.keywords
+                       if kw.arg == "pattern_key"), None)
+            if (isinstance(pk, _ast.Constant)
+                    and pk.value == "ssh_config_write"):
+                call = passed
+                break
+        assert call is not None, "ssh_config_write gate call not found"
 
         from tools.approval import _run_approval_gate
         required = [
@@ -1026,8 +1038,7 @@ class TestSSHConfigWriteGateSingleQuery:
             if param.kind == _inspect.Parameter.KEYWORD_ONLY
             and param.default is _inspect.Parameter.empty
         ]
-        missing = [k for k in required if not _re.search(
-            rf"\b{k}\s*=", block)]
+        missing = [k for k in required if k not in call]
         assert missing == [], (
             f"_run_approval_gate call at ssh_config_write gate is missing "
             f"required kwargs {missing}; it would raise TypeError instead "
