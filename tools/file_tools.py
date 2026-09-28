@@ -191,6 +191,18 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         with _env_lock:
             env = _active_environments.get(container_key) or _active_environments.get(task_id)
         if env is not None:
+            # The stamp comes FIRST (TJS-259 round 16). Plugin environments
+            # are duck-typed, so their class names carry no guarantee; the
+            # provider factory stamps ``_hermes_backend_name`` precisely so
+            # path resolution does not have to sniff class names. Consulting
+            # it only as a fallback meant a plugin stamped ``docker`` whose
+            # class name contained "local" was resolved with HOST path
+            # semantics instead of container ones.
+            stamped = getattr(env, "_hermes_backend_name", None)
+            if isinstance(stamped, str) and stamped.strip():
+                return stamped.strip().lower()
+            # Unstamped: the built-in classes do follow these names, so the
+            # substring match stays as the fallback for them.
             name = env.__class__.__name__.lower()
             if "local" in name:
                 return "local"
@@ -204,9 +216,6 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
-            stamped = getattr(env, "_hermes_backend_name", None)
-            if isinstance(stamped, str) and stamped:
-                return stamped
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
@@ -1114,6 +1123,13 @@ def _state_drift_error(targets: list[str], approved_states: list[str],
 #: local (TJS-259 round 13).
 _HOST_FILESYSTEM_BACKENDS = frozenset({"local"})
 
+#: Built-in environment classes whose filesystem IS the host's, matched by
+#: EXACT class name. Only consulted when an environment carries no
+#: ``_hermes_backend_name`` stamp. Exact identity, never a substring: a
+#: plugin class called ``LocalisedSandboxEnvironment`` contains "local" and
+#: is not the host at all (TJS-259 round 16).
+_HOST_FILESYSTEM_ENV_CLASSES = frozenset({"LocalEnvironment"})
+
 #: Key ``_get_env_config`` reports the backend type under. Asserted against
 #: the real config at import-time-ish in the tests, because reading a key
 #: that does not exist is exactly the round-13 defect.
@@ -1208,12 +1224,30 @@ def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
         # No environment yet AND no remote override declared above: the
         # global answer stands.
         return True
-    name = env.__class__.__name__.lower()
-    if "local" in name:
-        return True
+
+    # The STAMP is authoritative (round 16). ``agent/terminal_env_provider.py``
+    # states the factory stamps ``_hermes_backend_name`` precisely "so
+    # file-path resolution can identify plugin backends without class-name
+    # sniffing" — plugin environments are duck-typed and need not subclass
+    # BaseEnvironment, so their class names carry no guarantee whatsoever.
+    # Checking the class name FIRST meant a plugin stamped ``docker`` whose
+    # class merely contained "local" was treated as the host filesystem, and
+    # a protected backend target was written with no card.
     stamped = getattr(env, "_hermes_backend_name", None)
-    if isinstance(stamped, str) and \
-            stamped.strip().lower() in _HOST_FILESYSTEM_BACKENDS:
+    if isinstance(stamped, str) and stamped.strip():
+        declared = stamped.strip().lower()
+        if declared in _HOST_FILESYSTEM_BACKENDS:
+            return True
+        logger.warning(
+            "task %r has a terminal environment stamped %r; treating the file "
+            "backend as non-local so approval gating resolves through it",
+            task_id, declared)
+        return False
+
+    # Unstamped: only the built-in environments this file knows by name may
+    # take the fast path, matched by EXACT class identity. Substring matching
+    # is what let ``LocalisedSandboxEnvironment`` pass for the host.
+    if env.__class__.__name__ in _HOST_FILESYSTEM_ENV_CLASSES:
         return True
     logger.warning(
         "task %r has a non-local or unrecognised terminal environment %s; "
