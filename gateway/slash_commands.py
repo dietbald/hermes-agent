@@ -5452,6 +5452,29 @@ class GatewaySlashCommandsMixin:
                 provider = persisted.get("billing_provider")
                 base_url = persisted.get("billing_base_url")
 
+        # A freshly reset gateway session has no resident agent, transcript, or
+        # persisted billing route yet.  Fall back to the effective profile
+        # config so `/usage` can still show account allowance before the first
+        # model call.  Explicit provider values only: `auto` is not a billable
+        # route and must not be sent to the account-usage resolver.
+        if not provider:
+            try:
+                read_user_config = getattr(self, "_read_user_config", None)
+                user_config = read_user_config() if callable(read_user_config) else {}
+                model_config = (
+                    user_config.get("model") if isinstance(user_config, dict) else None
+                )
+                if isinstance(model_config, dict):
+                    configured_provider = str(model_config.get("provider") or "").strip()
+                    if configured_provider and configured_provider.lower() != "auto":
+                        provider = configured_provider
+                        base_url = model_config.get("base_url") or None
+            except Exception:
+                logger.debug(
+                    "Could not resolve configured provider for fresh-session /usage",
+                    exc_info=True,
+                )
+
         if wants_reset:
             normalized_provider = str(provider or "").strip().lower()
             if normalized_provider != "openai-codex":
