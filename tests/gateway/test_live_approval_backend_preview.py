@@ -49,9 +49,9 @@ def test_preview_text_is_read_through_the_task_file_backend(
         def __init__(self, inner):
             self._inner = inner
 
-        def read_file_raw(self, path, *a, **k):
+        def read_text_bounded(self, path, *a, **k):
             seen.append(str(path))
-            return self._inner.read_file_raw(path, *a, **k)
+            return self._inner.read_text_bounded(path, *a, **k)
 
         def __getattr__(self, name):
             return getattr(self._inner, name)
@@ -83,11 +83,11 @@ def test_container_card_shows_the_backend_preimage_not_plus_one_minus_zero(
         def __init__(self, inner):
             self._inner = inner
 
-        def read_file_raw(self, path, *a, **k):
+        def read_text_bounded(self, path, *a, **k):
             if str(host_absent) in str(path):
                 from tools.file_operations import ReadResult
                 return ReadResult(content=backend_text)
-            return self._inner.read_file_raw(path, *a, **k)
+            return self._inner.read_text_bounded(path, *a, **k)
 
         def content_digest(self, path, *a, **k):
             if str(host_absent) in str(path):
@@ -133,7 +133,7 @@ def test_preview_fails_closed_when_the_backend_cannot_be_read(
         def __init__(self, inner):
             self._inner = inner
 
-        def read_file_raw(self, path, *a, **k):
+        def read_text_bounded(self, path, *a, **k):
             raise OSError("backend unreachable")
 
         def content_digest(self, path, *a, **k):

@@ -922,24 +922,23 @@ def _current_file_text(filepath: str, task_id: str = "default") -> str:
     except Exception as exc:
         raise _PreimageUnavailable(str(filepath)) from exc
 
-    # Non-regular paths (FIFO, device, directory) have no reviewable text and
-    # must never be opened here — ``read_file_raw`` guards the blocking read
-    # with a stat-only probe, so this stays bounded (round 9/10).
+    # ONE non-blocking descriptor: type check and read happen on the same
+    # open file, never on a pathname twice (TJS-259 round 12).
+    # ``read_file_raw`` probed ``-f``/size and then re-opened the pathname for
+    # ``head`` and ``cat``; retargeting a symlink to a FIFO after the probe
+    # blocked the preview before a card could be raised.
     try:
-        result = ops.read_file_raw(filepath)
+        result = ops.read_text_bounded(filepath)
     except Exception as exc:
         raise _PreimageUnavailable(str(filepath)) from exc
 
     if getattr(result, "error", None):
-        # Distinguish "missing" from "unreadable" through the backend's own
-        # existence probe rather than by parsing the error text — the shell
-        # backend reports both as "File not found" on the read path, which is
-        # the ambiguity that produced round 7's defect 2.
-        try:
-            exists = ops.path_exists(filepath)
-        except Exception:
-            exists = None
-        if exists is False:
+        # "Missing" and "unreadable" must not be confused: an absent target
+        # is an honest creation, an unreadable one is a block. The backend
+        # reports which it is on the descriptor it actually opened, so this
+        # no longer depends on parsing an error string or on a second,
+        # racy existence probe.
+        if getattr(result, "path_absent", False):
             return ""
         raise _PreimageUnavailable(str(filepath))
 
@@ -1100,17 +1099,59 @@ def _state_drift_error(targets: list[str], approved_states: list[str],
     )
 
 
+def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
+    """Whether this task's file backend is the agent process's own filesystem.
+
+    When it is, host ``os.path.realpath`` and the backend's realpath are the
+    same answer, and asking the backend costs a subprocess per write. When it
+    is NOT (docker/ssh/modal/...), only the backend can answer and the host's
+    view is actively wrong (TJS-259 round 12).
+
+    Unknown answers "no", so an unrecognised backend pays the cost and gets
+    the correct answer rather than silently trusting the host.
+    """
+    try:
+        from tools.terminal_tool import _get_env_config
+        env_type = str((_get_env_config() or {}).get("type") or "local").lower()
+    except Exception:
+        return False
+    return env_type == "local"
+
+
 def _plan_realpaths(paths: list[str], plan: "dict[str, str | None] | None",
                     task_id: str = "default") -> dict[str, str]:
-    """Realpath of each raw path, taken from the ONE resolved plan.
+    """Realpath of each raw path, resolved BY THE TASK BACKEND.
 
-    TJS-259 round 10. Every resolution on the gated write path must come from
-    the same plan, including the ones that decide WHETHER a gate applies.
-    ``_resolve_path_for_task`` maps a path into the task's workspace;
-    ``realpath`` then follows symlinks, which is what the protected-file and
-    ssh-config predicates actually match on. Doing both once, here, is what
-    stops the gate deciding about a different file from the one written.
+    TJS-259 rounds 10 and 12. Every resolution on the gated write path must
+    come from the same plan AND the same filesystem, including the ones that
+    decide WHETHER a gate applies. ``_resolve_path_for_task`` maps a path into
+    the task's workspace; the backend's ``realpath`` then follows symlinks,
+    which is what the protected-file and ssh-config predicates match on.
+
+    Host ``os.path.realpath`` was wrong here (round 12): a container/SSH
+    backend can have ``notes.md -> AGENTS.md`` while the host sees an ordinary
+    file, so the gate answered "not protected" about the host's view while the
+    write followed the backend's symlink into the protected file, with no card
+    at all. Resolving through ``_get_file_ops(task_id)`` — the object that
+    performs the write — makes the checked path and the written path the same
+    by construction.
+
+    On a LOCAL backend the two are the same filesystem, so the host call is
+    used directly: this runs on every write, gated or not, and a backend
+    subprocess per write would be the cost regression round 7 fixed.
+
+    Fails CLOSED: when a non-local backend cannot resolve, the value is a
+    sentinel that no predicate matches and ``_write_gate_applies`` treats as
+    gated. An unresolved path must never read as "ordinary, no approval".
     """
+    local = _backend_shares_the_host_filesystem(task_id)
+    ops = None
+    if not local:
+        try:
+            ops = _get_file_ops(task_id)
+        except Exception:
+            ops = None
+
     out: dict[str, str] = {}
     for p in paths or []:
         planned = plan.get(p) if plan is not None else None
@@ -1119,11 +1160,27 @@ def _plan_realpaths(paths: list[str], plan: "dict[str, str | None] | None",
                 planned = str(_resolve_path_for_task(p, task_id))
             except (OSError, ValueError, RuntimeError):
                 planned = os.path.normpath(_expand_tilde(p))
-        try:
-            out[p] = os.path.realpath(planned)
-        except (OSError, ValueError):
-            out[p] = planned
+        resolved = None
+        if local:
+            try:
+                resolved = os.path.realpath(planned)
+            except (OSError, ValueError):
+                resolved = None
+        elif ops is not None:
+            try:
+                resolved = ops.realpath(planned)
+            except Exception:
+                resolved = None
+        out[p] = resolved if resolved else _UNRESOLVED_PATH
     return out
+
+
+#: Marker for a target the backend could not resolve. Deliberately not a
+#: path: it must not match a protected basename NOR look like an ordinary
+#: file. ``_write_gate_applies`` checks for it explicitly and answers
+#: "gated", so an unresolvable target is always reviewed by a human rather
+#: than silently cleared (TJS-259 round 12).
+_UNRESOLVED_PATH = "\x00hermes-unresolved\x00"
 
 
 def _write_gate_applies(paths: list[str], task_id: str = "default", *,
@@ -1148,6 +1205,10 @@ def _write_gate_applies(paths: list[str], task_id: str = "default", *,
     default.
     """
     try:
+        # An unresolvable target is never "ordinary": the backend could not
+        # tell us what file it is, so a human must look (round 12).
+        if any((realpaths or {}).get(p) == _UNRESOLVED_PATH for p in paths):
+            return True
         enabled, extra = _protected_instruction_config()
         if enabled and any(
                 _protected_instruction_reason(

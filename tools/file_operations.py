@@ -219,6 +219,11 @@ class ReadResult:
     mime_type: Optional[str] = None
     dimensions: Optional[str] = None  # For images: "WIDTHxHEIGHT"
     error: Optional[str] = None
+    #: Set only when the backend positively established the path does NOT
+    #: exist. Distinguishes "missing" from "unreadable", which the error text
+    #: alone cannot: the approval preview must render an absent target as a
+    #: creation and an unreadable one as a block (TJS-259 round 12).
+    path_absent: bool = False
     similar_files: List[str] = field(default_factory=list)
     
     def to_dict(self) -> dict:
@@ -594,6 +599,45 @@ class FileOperations(ABC):
         implemented this can only ever cause a block, never a false match.
         """
         return None
+
+    def realpath(self, path: str) -> Optional[str]:
+        """Fully-resolved path of *path*, as seen by THIS backend.
+
+        ``None`` means "could not resolve" and callers must fail closed.
+
+        Exists because the approval gates decide whether a target is
+        protected by matching on its resolved path (TJS-259 round 12). Host
+        ``os.path.realpath`` answers about the agent process's filesystem,
+        while the write goes through this backend: a container/SSH backend
+        can have ``notes.md -> AGENTS.md`` where the host sees an ordinary
+        file, so the gate cleared a write that landed in a protected file
+        with no card at all. Resolving through the same object that performs
+        the write makes "the path I checked" and "the path I write" the same
+        by construction.
+
+        The default is ``None`` so a backend that has not implemented this
+        can only ever cause a block, never a false clear.
+        """
+        return None
+
+    def read_text_bounded(self, path: str,
+                          max_bytes: int = 4 * 1024 * 1024) -> ReadResult:
+        """Text of a REGULAR file, read atomically under one descriptor.
+
+        Used to build the approval card's preimage, which is security
+        critical (TJS-259 round 12). ``read_file_raw`` probes ``-f``/size and
+        then re-opens the same PATHNAME for ``head`` and ``cat``: retarget a
+        symlink from a regular file to a FIFO after the probe and the later
+        open blocks forever. The type check and the read therefore have to
+        happen on ONE non-blocking descriptor, never on a pathname twice.
+
+        Returns ``ReadResult`` with ``.content`` on success, ``.error`` when
+        the path is unreadable or not a regular file, and
+        ``.error``+``path_absent=True`` when it does not exist. The default
+        implementation delegates to ``read_file_raw`` for backends that have
+        not implemented the atomic form.
+        """
+        return self.read_file_raw(path)
 
     def content_digest(self, path: str) -> Optional[str]:
         """SHA-256 hex of *path*'s bytes, computed ON the backend.
@@ -1940,6 +1984,127 @@ class ShellFileOperations(FileOperations):
         return None
 
     _DIGEST_UNREADABLE = "__hermes_digest_unreadable__"
+    _PATH_UNRESOLVABLE = "__hermes_realpath_failed__"
+    _READ_NOT_REGULAR = "__hermes_not_regular__"
+    _READ_ABSENT = "__hermes_absent__"
+
+    def realpath(self, path: str) -> Optional[str]:
+        """Backend-side realpath (see the base-class contract).
+
+        Resolved by the backend's own Python so container/SSH symlink graphs
+        the host cannot see are followed correctly (TJS-259 round 12).
+        ``strict=False`` so a not-yet-created target still resolves its
+        parent chain — a write that creates a file inside a symlinked
+        directory must still be gated on where that directory really points.
+        """
+        target = self._expand_path(path)
+        snippet = (
+            "import os, sys\n"
+            f"p = {target!r}\n"
+            "try:\n"
+            "    print(os.path.realpath(p))\n"
+            "except Exception:\n"
+            f"    print({self._PATH_UNRESOLVABLE!r})\n"
+        )
+        try:
+            result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+            if result.exit_code != 0 and "python3" in (result.stdout or ""):
+                result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+        except Exception:
+            return None
+        if result.exit_code != 0:
+            return None
+        lines = _strip_terminal_fence_leaks(result.stdout).strip().splitlines()
+        if not lines:
+            return None
+        answer = lines[-1].strip()
+        if not answer or answer == self._PATH_UNRESOLVABLE:
+            return None
+        return answer
+
+    def read_text_bounded(self, path: str,
+                          max_bytes: int = 4 * 1024 * 1024) -> ReadResult:
+        """Backend-side atomic bounded read (see the base-class contract).
+
+        ONE descriptor, opened non-blocking, type-checked with ``fstat`` on
+        that descriptor, then read from it (TJS-259 round 12). No pathname is
+        touched twice, so there is no window in which the target can change
+        type between the check and the read — which is what let a symlink
+        retargeted to a FIFO after ``read_file_raw``'s size probe block the
+        approval preview before a card could be raised.
+
+        Bounded: at most *max_bytes* cross the boundary, base64-framed so
+        binary or fence-like content cannot corrupt the transport.
+        """
+        target = self._expand_path(path)
+        snippet = (
+            "import base64, errno, os, stat, sys\n"
+            f"p = {target!r}\n"
+            f"limit = {int(max_bytes)!r}\n"
+            "fd = -1\n"
+            "try:\n"
+            "    try:\n"
+            "        fd = os.open(p, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))\n"
+            "    except OSError as e:\n"
+            "        if e.errno == errno.ENOENT:\n"
+            f"            print({self._READ_ABSENT!r})\n"
+            "            raise SystemExit(0)\n"
+            "        raise\n"
+            "    if not stat.S_ISREG(os.fstat(fd).st_mode):\n"
+            f"        print({self._READ_NOT_REGULAR!r})\n"
+            "        raise SystemExit(0)\n"
+            "    chunks = []\n"
+            "    got = 0\n"
+            "    while got < limit:\n"
+            "        b = os.read(fd, min(1048576, limit - got))\n"
+            "        if not b:\n"
+            "            break\n"
+            "        chunks.append(b)\n"
+            "        got += len(b)\n"
+            "    sys.stdout.write('__hermes_b64__')\n"
+            "    sys.stdout.write(base64.b64encode(b''.join(chunks)).decode())\n"
+            "    sys.stdout.write('\\n')\n"
+            "except SystemExit:\n"
+            "    raise\n"
+            "except Exception:\n"
+            f"    print({self._DIGEST_UNREADABLE!r})\n"
+            "finally:\n"
+            "    if fd >= 0:\n"
+            "        try:\n"
+            "            os.close(fd)\n"
+            "        except OSError:\n"
+            "            pass\n"
+        )
+        try:
+            result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+            if result.exit_code != 0 and "python3" in (result.stdout or ""):
+                result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+        except Exception:
+            return ReadResult(error=f"Failed to read file: {path}")
+        if result.exit_code != 0:
+            return ReadResult(error=f"Failed to read file: {path}")
+        lines = _strip_terminal_fence_leaks(result.stdout).strip().splitlines()
+        if not lines:
+            return ReadResult(error=f"Failed to read file: {path}")
+        answer = lines[-1].strip()
+        if answer == self._READ_ABSENT:
+            return ReadResult(error=f"File not found: {path}", path_absent=True)
+        if answer == self._READ_NOT_REGULAR:
+            return self._not_regular_error(path)
+        if answer == self._DIGEST_UNREADABLE:
+            return ReadResult(error=f"Failed to read file: {path}")
+        # Explicitly framed: an EMPTY file base64-encodes to the empty string,
+        # which is indistinguishable from "no output" without the marker. That
+        # made every empty target read as unreadable, which fails closed and
+        # would have blocked ordinary writes to empty protected files.
+        if not answer.startswith("__hermes_b64__"):
+            return ReadResult(error=f"Failed to read file: {path}")
+        payload = answer[len("__hermes_b64__"):]
+        try:
+            raw = base64.b64decode(payload, validate=True) if payload else b""
+        except Exception:
+            return ReadResult(error=f"Failed to read file: {path}")
+        return ReadResult(content=raw.decode("utf-8", errors="replace"))
 
     def content_digest(self, path: str) -> Optional[str]:
         """Backend-side streaming SHA-256 (see the base-class contract).
