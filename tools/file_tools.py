@@ -792,7 +792,8 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  resolved: str | None = None) -> str | None:
     """Return a short label when ``filepath`` targets a protected
     agent-instruction file, else ``None``.
 
@@ -800,6 +801,14 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     neither a symlink pointing AT a protected file (#41351) nor a protected
     name that is itself a symlink escapes the gate. ``..`` traversal is
     neutralized by normpath/realpath before the basename compare.
+
+    ``resolved`` is the realpath from the caller's ONE path plan (TJS-259
+    round 10). Resolving here independently made the gate decision and the
+    write two separate questions about possibly different files: retarget a
+    symlink between the plan and this call and the gate answered "not
+    protected" about the new target while the write still went to the
+    planned protected one — a protected file overwritten with no card at
+    all. Callers on the gated write path MUST pass it.
     """
     if enabled is None or extra_patterns is None:
         enabled, extra_patterns = _protected_instruction_config()
@@ -807,10 +816,12 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         return None
 
     normalized = os.path.normpath(_expand_tilde(filepath))
-    try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
-    except (OSError, ValueError, RuntimeError):
-        resolved = os.path.realpath(normalized)
+    if resolved is None:
+        try:
+            resolved = os.path.realpath(
+                str(_resolve_path_for_task(filepath, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            resolved = os.path.realpath(normalized)
 
     # The authoritative ~/.hermes home is governed by its own guards
     # (config.yaml hard-block, cross-profile guard, write_approval); this
@@ -1056,7 +1067,34 @@ def _state_drift_error(targets: list[str], approved_states: list[str],
     )
 
 
-def _write_gate_applies(paths: list[str], task_id: str = "default") -> bool:
+def _plan_realpaths(paths: list[str], plan: "dict[str, str | None] | None",
+                    task_id: str = "default") -> dict[str, str]:
+    """Realpath of each raw path, taken from the ONE resolved plan.
+
+    TJS-259 round 10. Every resolution on the gated write path must come from
+    the same plan, including the ones that decide WHETHER a gate applies.
+    ``_resolve_path_for_task`` maps a path into the task's workspace;
+    ``realpath`` then follows symlinks, which is what the protected-file and
+    ssh-config predicates actually match on. Doing both once, here, is what
+    stops the gate deciding about a different file from the one written.
+    """
+    out: dict[str, str] = {}
+    for p in paths or []:
+        planned = plan.get(p) if plan is not None else None
+        if not planned:
+            try:
+                planned = str(_resolve_path_for_task(p, task_id))
+            except (OSError, ValueError, RuntimeError):
+                planned = os.path.normpath(_expand_tilde(p))
+        try:
+            out[p] = os.path.realpath(planned)
+        except (OSError, ValueError):
+            out[p] = planned
+    return out
+
+
+def _write_gate_applies(paths: list[str], task_id: str = "default", *,
+                        realpaths: "dict[str, str] | None" = None) -> bool:
     """Whether any approval gate will look at this request.
 
     TJS-259 round 7, defect 4: identity (and therefore state hashing) used to
@@ -1080,14 +1118,16 @@ def _write_gate_applies(paths: list[str], task_id: str = "default") -> bool:
         enabled, extra = _protected_instruction_config()
         if enabled and any(
                 _protected_instruction_reason(
-                    p, task_id, enabled=enabled, extra_patterns=extra)
+                    p, task_id, enabled=enabled, extra_patterns=extra,
+                    resolved=(realpaths or {}).get(p))
                 for p in paths):
             return True
     except Exception:
         return True  # cannot tell → assume gated (fail safe)
     try:
         from agent.file_safety import is_write_approval_required
-        if any(is_write_approval_required(p) for p in paths):
+        if any(is_write_approval_required(p, (realpaths or {}).get(p))
+               for p in paths):
             return True
     except Exception:
         return True
@@ -1530,7 +1570,8 @@ def _request_protected_instruction_approval(
 def _check_protected_instruction_write(
         paths: list[str], task_id: str = "default",
         preview: "_WritePreview | _PreviewFailed | None" = None,
-        identity: str | None = None) -> str | None:
+        identity: str | None = None,
+        realpaths: "dict[str, str] | None" = None) -> str | None:
     """Gate a write/patch touching protected instruction files.
 
     Returns ``None`` when no target is protected or the human approved;
@@ -1541,7 +1582,9 @@ def _check_protected_instruction_write(
     more surprising than an atomic all-or-nothing outcome.
 
     ``identity`` (TJS-258) is the write-request identity a released "once"
-    answer is bound to; see ``_write_request_identity``.
+    answer is bound to; see ``_write_request_identity``. ``realpaths``
+    (TJS-259 round 10) is the ONE plan's realpath per raw path, so this gate
+    decides about exactly the file the write will touch.
     """
     enabled, extra = _protected_instruction_config()
     if not enabled:
@@ -1549,7 +1592,8 @@ def _check_protected_instruction_write(
     reasons: list[str] = []
     for p in paths:
         reason = _protected_instruction_reason(
-            p, task_id, enabled=enabled, extra_patterns=extra)
+            p, task_id, enabled=enabled, extra_patterns=extra,
+            resolved=(realpaths or {}).get(p))
         if reason:
             reasons.append(reason)
     if not reasons:
@@ -1561,7 +1605,8 @@ def _check_protected_instruction_write(
 def _check_approval_required_write(
         paths: list[str], task_id: str = "default",
         preview: "_WritePreview | _PreviewFailed | None" = None,
-        identity: str | None = None) -> str | None:
+        identity: str | None = None,
+        realpaths: "dict[str, str] | None" = None) -> str | None:
     """Gate a write/patch touching an approval-required path (``~/.ssh/config``).
 
     These paths are NOT credentials and NOT hard-denied, but a write must
@@ -1581,7 +1626,8 @@ def _check_approval_required_write(
     except Exception:
         return None
 
-    targets = [p for p in paths if is_write_approval_required(p)]
+    targets = [p for p in paths
+               if is_write_approval_required(p, (realpaths or {}).get(p))]
     if not targets:
         return None
 
@@ -2879,11 +2925,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     except Exception:
         _resolved = None
     _plan: dict[str, str | None] = {path: _resolved}
+    # Realpaths from that SAME plan, so the gate DECISION is about the file
+    # the write will touch (TJS-259 round 10).
+    _realpaths = _plan_realpaths([path], _plan, task_id)
 
     # TJS-259 round 7 defect 4: only pay for the preview + state hashing when
     # a gate actually exists to consume them. An ungated write used to hash
     # every touched path (1.178s on a 1 GiB file).
-    _gated = _write_gate_applies([path], task_id)
+    _gated = _write_gate_applies([path], task_id, realpaths=_realpaths)
     _approved_targets: list[str] = []
     _approved_states: list[str] = []
     if _gated:
@@ -2902,11 +2951,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             [path], task_id, mode="write", content=content,
             states=_approved_states)
         protected_err = _check_protected_instruction_write(
-            [path], task_id, _preview, _identity)
+            [path], task_id, _preview, _identity, realpaths=_realpaths)
         if protected_err:
             return tool_error(protected_err)
         approval_err = _check_approval_required_write(
-            [path], task_id, _preview, _identity)
+            [path], task_id, _preview, _identity, realpaths=_realpaths)
         if approval_err:
             return tool_error(approval_err)
     if not cross_profile:
@@ -3084,11 +3133,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         except Exception:
             _path_to_resolved[_p] = None
 
+    # Realpaths from that SAME plan, so the gate DECISION is about the files
+    # the patch will touch (TJS-259 round 10).
+    _realpaths = _plan_realpaths(_paths_to_check, _path_to_resolved, task_id)
+
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     # TJS-259 round 7 defect 4: skipped entirely when no gate applies, so an
     # ordinary V4A Delete/Move of a large file stays metadata-bound.
-    _gated = _write_gate_applies(_paths_to_check, task_id)
+    _gated = _write_gate_applies(_paths_to_check, task_id,
+                                 realpaths=_realpaths)
     if _gated:
         # Same fail-closed rule as write_file (round 9): an unresolvable path
         # in a gated request has no plan to authorize or lock, and both the
@@ -3129,11 +3183,13 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             states=_approved_states,
             patch=patch if mode == "patch" else None)
         protected_err = _check_protected_instruction_write(
-            _paths_to_check, task_id, _preview, _identity)
+            _paths_to_check, task_id, _preview, _identity,
+            realpaths=_realpaths)
         if protected_err:
             return tool_error(protected_err)
         approval_err = _check_approval_required_write(
-            _paths_to_check, task_id, _preview, _identity)
+            _paths_to_check, task_id, _preview, _identity,
+            realpaths=_realpaths)
         if approval_err:
             return tool_error(approval_err)
     try:
