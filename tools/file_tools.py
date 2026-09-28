@@ -1099,6 +1099,18 @@ def _state_drift_error(targets: list[str], approved_states: list[str],
     )
 
 
+#: Backend types whose filesystem IS the agent process's own. Only these may
+#: use the host fast path in :func:`_plan_realpaths`. An allowlist, not a
+#: blocklist: a backend nobody anticipated must be asked, never assumed
+#: local (TJS-259 round 13).
+_HOST_FILESYSTEM_BACKENDS = frozenset({"local"})
+
+#: Key ``_get_env_config`` reports the backend type under. Asserted against
+#: the real config at import-time-ish in the tests, because reading a key
+#: that does not exist is exactly the round-13 defect.
+_ENV_TYPE_KEY = "env_type"
+
+
 def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
     """Whether this task's file backend is the agent process's own filesystem.
 
@@ -1107,15 +1119,33 @@ def _backend_shares_the_host_filesystem(task_id: str = "default") -> bool:
     is NOT (docker/ssh/modal/...), only the backend can answer and the host's
     view is actively wrong (TJS-259 round 12).
 
-    Unknown answers "no", so an unrecognised backend pays the cost and gets
-    the correct answer rather than silently trusting the host.
+    Fails CLOSED in every ambiguous case (TJS-259 round 13). The first version
+    read ``_get_env_config()["type"]``; the real key is ``env_type``, so the
+    lookup returned ``None`` for EVERY backend, defaulted to ``"local"``, and
+    took the host fast path unconditionally — including under Docker, which is
+    the case the backend realpath exists for. A protected write through a
+    backend-only symlink then completed with no card.
+
+    The shape matters more than the key. A missing key, an unreadable config
+    and an unrecognised backend all answer "not local": the cost of being
+    wrong that way is a subprocess, while the cost of being wrong the other
+    way is an unapproved write to a protected file.
     """
     try:
         from tools.terminal_tool import _get_env_config
-        env_type = str((_get_env_config() or {}).get("type") or "local").lower()
+        config = _get_env_config() or {}
     except Exception:
         return False
-    return env_type == "local"
+    if _ENV_TYPE_KEY not in config:
+        # The key was renamed or the config is not the shape we expect. We
+        # cannot tell what backend this is, so we do not trust the host.
+        logger.warning(
+            "terminal env config has no %r key; treating the file backend as "
+            "non-local so approval gating resolves paths through it",
+            _ENV_TYPE_KEY)
+        return False
+    env_type = str(config.get(_ENV_TYPE_KEY) or "").strip().lower()
+    return env_type in _HOST_FILESYSTEM_BACKENDS
 
 
 def _plan_realpaths(paths: list[str], plan: "dict[str, str | None] | None",
