@@ -118,6 +118,58 @@ def test_render_account_usage_lines_includes_reset_and_provider():
     assert "Credits balance: $9.99" in lines[3]
 
 
+def test_anthropic_weekly_exhaustion_marks_account_blocked_even_with_empty_session(monkeypatch):
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda: "oauth-token")
+    monkeypatch.setattr("agent.account_usage._is_oauth_token", lambda token: True)
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _Client(
+            {
+                "five_hour": {"utilization": 0.0, "resets_at": "2026-09-25T20:00:00Z"},
+                "seven_day": {"utilization": 1.0, "resets_at": "2026-09-27T09:00:00Z"},
+                "limits": [
+                    {
+                        "kind": "weekly_scoped",
+                        "percent": 15,
+                        "scope": {"model": {"display_name": "Fable"}},
+                    }
+                ],
+            }
+        ),
+    )
+
+    snapshot = fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    rendered = "\n".join(render_account_usage_lines(snapshot))
+    assert "Current session: 100% remaining (0% used)" in rendered
+    assert "Current week: 0% remaining (100% used)" in rendered
+    assert "Status: BLOCKED" in rendered
+    assert "Current week exhausted" in rendered
+    assert "Status: AVAILABLE" not in rendered
+
+
+def test_anthropic_below_all_overall_limits_marks_account_available(monkeypatch):
+    monkeypatch.setattr("agent.account_usage.resolve_anthropic_token", lambda: "oauth-token")
+    monkeypatch.setattr("agent.account_usage._is_oauth_token", lambda token: True)
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _Client(
+            {
+                "five_hour": {"utilization": 0.25},
+                "seven_day": {"utilization": 0.80},
+            }
+        ),
+    )
+
+    snapshot = fetch_account_usage("anthropic")
+
+    assert snapshot is not None
+    rendered = "\n".join(render_account_usage_lines(snapshot))
+    assert "Status: AVAILABLE" in rendered
+    assert "Status: BLOCKED" not in rendered
+
+
 def test_fetch_account_usage_openrouter_uses_limit_remaining_and_ignores_deprecated_rate_limit(monkeypatch):
     monkeypatch.setattr(
         "agent.account_usage.resolve_runtime_provider",

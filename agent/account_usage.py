@@ -790,7 +790,27 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
                 reset_at=_parse_dt(window.get("resets_at")),
             )
         )
+    # The session and weekly windows are independent overall hard gates.  A
+    # fresh session does not restore availability while the weekly gate is
+    # exhausted, and remaining model-scoped capacity does not override either
+    # overall gate.  Make that verdict explicit instead of leaving callers to
+    # infer it from several otherwise-contradictory-looking percentages.
+    overall_labels = {"Current session", "Current week"}
+    exhausted_overall = [
+        window.label
+        for window in windows
+        if window.label in overall_labels
+        and window.used_percent is not None
+        and window.used_percent >= 100
+    ]
     details: list[str] = []
+    if exhausted_overall:
+        gates = ", ".join(exhausted_overall)
+        details.append(
+            f"Status: BLOCKED — {gates} exhausted; Claude is unavailable until the exhausted overall window resets."
+        )
+    else:
+        details.append("Status: AVAILABLE — no overall Claude quota window is exhausted.")
     extra = payload.get("extra_usage") or {}
     if extra.get("is_enabled"):
         used_credits = extra.get("used_credits")

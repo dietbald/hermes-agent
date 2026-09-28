@@ -163,6 +163,57 @@ class TestUsageAccountSection:
         assert "📈 **Account limits**" in result
 
     @pytest.mark.asyncio
+    async def test_usage_command_uses_profile_provider_in_fresh_session(self, monkeypatch):
+        """`/usage` after `/new` shows allowance before the first model call."""
+        runner = _make_runner(SK)
+        runner._session_db = None
+        setattr(
+            runner,
+            "_read_user_config",
+            MagicMock(return_value={
+                "model": {
+                    "default": "claude-opus-5",
+                    "provider": "anthropic",
+                }
+            }),
+        )
+        session_entry = MagicMock(session_id="fresh-session")
+        session_store = MagicMock()
+        setattr(runner, "session_store", session_store)
+        session_store.get_or_create_session.return_value = session_entry
+        session_store.load_transcript.return_value = []
+
+        calls = []
+
+        async def _fake_to_thread(fn, *args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return fn(*args, **kwargs)
+
+        monkeypatch.setattr("gateway.run.asyncio.to_thread", _fake_to_thread)
+        monkeypatch.setattr(
+            "gateway.slash_commands.fetch_account_usage",
+            lambda provider, base_url=None, api_key=None: object(),
+        )
+        monkeypatch.setattr(
+            "gateway.slash_commands.render_account_usage_lines",
+            lambda snapshot, markdown=False: [
+                "📈 **Account limits**",
+                "Provider: anthropic",
+                "Current week: 0% remaining (100% used)",
+            ],
+        )
+        monkeypatch.setattr("agent.account_usage.nous_credits_lines", lambda markdown=False: [])
+
+        event = MagicMock()
+        event.get_command_args.return_value = ""
+        result = await runner._handle_usage_command(event)
+
+        account_call = next(c for c in calls if c["args"] == ("anthropic",))
+        assert account_call["kwargs"]["base_url"] is None
+        assert "📈 **Account limits**" in result
+        assert "Current week: 0% remaining" in result
+
+    @pytest.mark.asyncio
     async def test_usage_command_prefers_dominant_persisted_route(self, monkeypatch):
         runner = _make_runner(SK)
         runner._session_db = AsyncSessionDB(MagicMock())
