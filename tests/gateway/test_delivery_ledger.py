@@ -430,10 +430,14 @@ class TestRuntimeFailedSweep:
 
         dl.mark_delivered("ob-1")
         _record(platform="telegram")
+        dl.mark_attempting("ob-1")
+        dl.mark_failed("ob-1", "TimedOut: sendMessage read timed out")
 
         row = _row("ob-1")
         assert row["state"] == "cancelled"
         assert row["cancelled_at"] is not None
+        assert row["retryable"] == 0
+        assert dl.sweep_failed_for_runtime("telegram", now=time.time() + 999) == []
 
     def test_alert_file_repeats_after_interval(self):
         _record(platform="telegram")

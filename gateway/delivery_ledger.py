@@ -295,7 +295,7 @@ def record_obligation(
 
 
 def mark_attempting(obligation_id: str) -> None:
-    _update_state(obligation_id, "attempting")
+    _update_state(obligation_id, "attempting", guard_cancelled=True)
 
 
 def mark_delivered(obligation_id: str) -> None:
@@ -495,12 +495,19 @@ def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     return bool(cursor.rowcount)
 
 
-def _update_state(obligation_id: str, state: str, error: str = "") -> None:
+def _update_state(
+    obligation_id: str,
+    state: str,
+    error: str = "",
+    *,
+    guard_cancelled: bool = False,
+) -> None:
     with _DB_LOCK, _transaction() as conn:
+        cancelled_guard = " AND state != 'cancelled'" if guard_cancelled else ""
         conn.execute(
-            """UPDATE delivery_obligations
+            f"""UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
+               WHERE obligation_id=?{cancelled_guard}""",
             (state, time.time(), error[:500] if error else None, obligation_id),
         )
 
